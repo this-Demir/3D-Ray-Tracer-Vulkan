@@ -2,7 +2,50 @@
 
 This project is a high-performance ray tracer written in Java using Vulkan (via LWJGL). It uses a Bounding Volume Hierarchy (BVH) to accelerate ray-triangle intersections, achieving O(log n) performance.
 
-## Current Status (Headless Engine)
+
+# Vulkan BVH Ray Tracer
+
+This project is a high-performance, real-time ray tracer written in Java using Vulkan (via LWJGL) and a Java Swing UI. It uses a Bounding Volume Hierarchy (BVH) built on the CPU to achieve dynamic `O(log n)` rendering performance on the GPU.
+
+## Current Status (Live Viewer)
+
+The project has evolved from a "headless" renderer into a "smart," multi-threaded, real-time viewer with a stable Swing (`JFrame`) UI.
+
+* **High Performance:** Renders complex models (e.g., 49,000+ triangles) at 60+ FPS using an `O(log n)` BVH acceleration structure.
+* **Dynamic Camera:** Features a fully dynamic camera controlled by the keyboard (WASD), sending updates to the shader via a Uniform Buffer Object (UBO).
+* **Stable Multi-Threaded Architecture:** The application is split into three decoupled threads for maximum performance and UI responsiveness:
+    1.  **UI Thread (Swing EDT):** Manages the `JFrame` and user input. It never freezes.
+    2.  **VRT (Vulkan Engine Thread):** A dedicated thread running the `VulkanEngine` class, which manages all Vulkan calls and the render loop.
+    3.  **SRT (Scene Rebuild Thread):** A background thread (`CompletableFuture`) that runs the `SceneBuilder` to perform CPU-heavy tasks (like BVH construction) without blocking the UI.
+
+## Future Plan: Interactive Scene Editor
+
+The next goal is to evolve this viewer into a fully interactive scene editor, similar to the `raytracer-java` project, by implementing a path tracing shader and a scene management system.
+
+### Current Development Roadmap
+
+1.  **Phase 1: Scene Graph System (CPU)**
+    * Create a `Scene.java` class to manage a dynamic list of objects (`Meshes`, `Spheres`, etc.) instead of a single static model.
+    * Update `SceneBuilder.java` to consume this `Scene` object and build a single, unified BVH for all objects.
+    * Implement Swing UI controls to add/remove objects and trigger a scene rebuild (`rebuildSceneAsync`).
+
+2.  **Phase 2: Path Tracing Shader (GPU)**
+    * Rewrite the `compute_dynamic.comp` shader to be a full, multi-bounce path tracer (porting logic from `raytracer-java`'s `PathTracer.java`).
+    * Implement a Random Number Generator (RNG) inside the shader.
+    * Implement a sky gradient background when a ray hits nothing.
+
+3.  **Phase 3: Material System (CPU + GPU)**
+    * Expand the `Material` struct on the GPU and CPU to support different types (Lambertian, Metal, Dielectric).
+    * Implement `scatter` logic in the shader to handle realistic reflections and refractions (mirrors, glass).
+
+4.  **Phase 4: Emissive Lighting (CPU + GPU)**
+    * Add an `Emissive` material type.
+    * Update the shader so that rays hitting an emissive object stop bouncing and return light, turning those objects into light sources.
+    * Add UI controls to add/move light sources (which are just objects with an emissive material) and rebuild the scene. 
+
+
+
+## Old Status (Headless Engine)
 
 The project is currently a "headless" single-shot renderer (`VulkanApp.java`). In its present state, it successfully:
 
@@ -12,7 +55,7 @@ The project is currently a "headless" single-shot renderer (`VulkanApp.java`). I
 4.  Executes a Vulkan compute shader (`compute.comp`) that traces rays against the BVH, achieving O(log n) average-case complexity per ray.
 5.  Waits for the GPU to finish, copies the resulting image back from VRAM, and saves it to a PNG file before exiting.
 
-## Future Plan: Dynamic JavaFX Editor
+##  OLD Future Plan: Dynamic JavaFX Editor : DONE
 
 The next goal is to transform this powerful headless engine into a fully dynamic, real-time scene editor with a JavaFX UI.
 
