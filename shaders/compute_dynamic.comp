@@ -1,0 +1,161 @@
+#version 450
+
+/* * "Akıllı Motor" için güncellenmiş Compute Shader.
+ * [cite_start]Kamera verisini (origin, viewport) hardcoded [cite: 1, 91-97] almak yerine
+ * binding = 4'teki bir Uniform Buffer Object'ten (UBO) okur.
+ */
+
+// --- Structs (Aynı) ---
+struct Vertex { vec3 pos; float pad; };
+struct Material { vec3 albedo; float type; };
+struct Ray { vec3 origin; vec3 dir; };
+struct LinearBVHNode {
+    vec3 bbox_min; float pad1;
+    vec3 bbox_max; float pad2;
+    int data;
+    int count;
+};
+
+// --- BINDINGS ---
+layout(rgba8, set = 0, binding = 0) uniform restrict writeonly image2D resultImage;
+layout(std430, set = 0, binding = 1) buffer TriangleBuffer { Vertex vertices[]; } triBuf;
+layout(std430, set = 0, binding = 2) buffer MaterialBuffer { Material materials[]; } matBuf;
+layout(std430, set = 0, binding = 3) buffer BVHBuffer { LinearBVHNode nodes[]; } bvhBuf;
+
+// --- YENİ: Kamera UBO (Binding 4) ---
+// std140 layout, vec3'ün 16 byte (vec4) hizalaması gerektirdiğini belirtir
+layout(std140, set = 0, binding = 4) uniform CameraUBO {
+    vec3 origin;            // offset 0 (12 byte)
+// 4 byte padding
+    vec3 lower_left_corner; // offset 16 (12 byte)
+// 4 byte padding
+    vec3 horizontal;        // offset 32 (12 byte)
+// 4 byte padding
+    vec3 vertical;          // offset 48 (12 byte)
+} cam;
+
+// --- Push Constants (Aynı) ---
+layout(push_constant) uniform Constants {
+    int numTriangles;
+} constants;
+
+// --- Yardımcı Fonksiyonlar (Aynı) ---
+const float T_MIN = 0.001;
+const float T_MAX = 10000.0;
+
+vec3 ray_at(Ray r, float t) {
+    return r.origin + r.dir * t;
+}
+
+
+bool hit_aabb(Ray r, vec3 bbox_min, vec3 bbox_max) {
+    vec3 invDir = 1.0 / r.dir;
+    vec3 t0s = (bbox_min - r.origin) * invDir;
+    vec3 t1s = (bbox_max - r.origin) * invDir;
+
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+
+    float t_enter = max(max(tmin.x, tmin.y), tmin.z);
+    float t_exit = min(min(tmax.x, tmax.y), tmax.z);
+
+    return t_exit > t_enter && t_exit > T_MIN && t_enter < T_MAX;
+}
+
+// --- 6. INTERSECTION: TRIANGLE ---
+bool hit_triangle(Ray r, vec3 v0, vec3 v1, vec3 v2, inout float closest_t) {
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 ray_cross_e2 = cross(r.dir, edge2);
+    float det = dot(edge1, ray_cross_e2);
+
+    if (det > -0.00001 && det < 0.00001) return false;
+
+    float inv_det = 1.0 / det;
+    vec3 s = r.origin - v0;
+    float u = inv_det * dot(s, ray_cross_e2);
+
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 s_cross_e1 = cross(s, edge1);
+    float v = inv_det * dot(r.dir, s_cross_e1);
+
+    if (v < 0.0 || (u + v) > 1.0) return false;
+
+    float t = inv_det * dot(edge2, s_cross_e1);
+    if (t > T_MIN && t < closest_t) {
+        closest_t = t;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// --- ANA SHADER ---
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 image_size = imageSize(resultImage);
+    if (pixel_coords.x >= image_size.x || pixel_coords.y >= image_size.y) {
+        return;
+    }
+
+    // --- 7a. Işın Hesaplama (DEĞİŞTİ) ---
+    float u_raw = float(pixel_coords.x) / float(image_size.x);
+    float v_raw = float(image_size.y - 1 - pixel_coords.y) / float(image_size.y); // Y-flip
+
+
+Ray r;
+    r.origin = cam.origin;
+    r.dir = normalize(
+    cam.lower_left_corner + (cam.horizontal * u_raw) + (cam.vertical * v_raw) - cam.origin
+);
+
+
+float closest_t = T_MAX;
+vec4 final_color = vec4(0.0, 0.0, 0.0, 1.0); // Arka plan
+bool hit_anything = false;
+int hit_triangle_index = -1;
+vec3 hit_normal = vec3(0,0,0);
+int stack[256];
+int stackPtr = 0;
+stack[stackPtr++] = 0;
+while (stackPtr > 0) {
+    int nodeIndex = stack[--stackPtr];
+    LinearBVHNode node = bvhBuf.nodes[nodeIndex];
+    if (hit_aabb(r, node.bbox_min, node.bbox_max)) {
+        if (node.count < 0) {
+            int triangleIndex = -(node.data + 1);
+            int currentTriIndex = triangleIndex;
+            vec3 v0 = triBuf.vertices[currentTriIndex * 3 + 0].pos;
+            vec3 v1 = triBuf.vertices[currentTriIndex * 3 + 1].pos;
+            vec3 v2 = triBuf.vertices[currentTriIndex * 3 + 2].pos;
+            float temp_t = closest_t;
+            if (hit_triangle(r, v0, v1, v2, temp_t)) {
+                closest_t = temp_t;
+                hit_anything = true;
+                hit_triangle_index = currentTriIndex;
+                vec3 edge1 = v1 - v0;
+                vec3 edge2 = v2 - v0;
+                hit_normal = normalize(cross(edge1, edge2));
+            }
+        } else {
+            int leftChildIndex = node.data;
+            int rightChildIndex = node.count;
+            stack[stackPtr++] = leftChildIndex;
+            stack[stackPtr++] = rightChildIndex;
+        }
+    }
+}
+
+
+if (hit_anything) {
+    Material mat = matBuf.materials[hit_triangle_index];
+    vec3 light_dir = normalize(vec3(1, 1, 1));
+    float light_intensity = max(0.0, dot(hit_normal, light_dir)) * 0.8 + 0.2;
+    final_color = vec4(mat.albedo * light_intensity, 1.0);
+}
+
+// --- 7d. Renk Yazma (Aynı) ---
+imageStore(resultImage, pixel_coords, final_color);
+}

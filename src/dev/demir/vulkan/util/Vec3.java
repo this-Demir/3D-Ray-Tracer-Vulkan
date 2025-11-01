@@ -1,5 +1,7 @@
 package dev.demir.vulkan.util;
 
+import java.nio.ByteBuffer;
+
 /**
  * Represents a 3D Vector or Point.
  * This is a clean re-implementation of the logic from 'raytracer-java/core/Vec3.java'
@@ -101,5 +103,23 @@ public class Vec3 {
     @Override
     public String toString() {
         return "Vec3(" + x + ", " + y + ", " + z + ")";
+    }
+
+    public Vec3 normalize() {
+        double len2 = lengthSquared();
+        if (len2 == 0.0) return this;
+        double invLen = 1.0 / Math.sqrt(len2);
+        return new Vec3(x * invLen, y * invLen, z * invLen);
+    }
+
+
+    /**
+     * NEW: Helper method to store this vector's data in a ByteBuffer
+     * as three FLOATS, for use with std140 UBOs.
+     */
+    public void store(int offset, ByteBuffer buffer) {
+        buffer.putFloat(offset, (float)x);
+        buffer.putFloat(offset + 4, (float)y);
+        buffer.putFloat(offset + 8, (float)z);
     }
 }
