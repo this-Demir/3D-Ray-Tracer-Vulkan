@@ -1,0 +1,237 @@
+#version 450
+
+precision highp float; // ES portu/alışkanlık için bırakıldı
+
+/*
+ * Phase 3: Gerçek Path Tracing Motoru
+ */
+
+// --- Structs (Veri Yapıları) ---
+struct Vertex { vec3 pos; float pad; };
+struct Material { vec3 albedo; float type; }; // type: 0=Lambertian, 1=Metal, 2=FuzzyMetal
+struct Ray { vec3 origin; vec3 dir; };
+struct LinearBVHNode {
+    vec3 bbox_min; float pad1;
+    vec3 bbox_max; float pad2;
+    int data;
+    int count;
+};
+
+// --- BINDINGS (Veri Bağlantıları) ---
+layout(rgba8, set = 0, binding = 0) uniform restrict writeonly image2D resultImage;
+layout(std430, set = 0, binding = 1) buffer TriangleBuffer { Vertex vertices[]; } triBuf;
+layout(std430, set = 0, binding = 2) buffer MaterialBuffer { Material materials[]; } matBuf;
+layout(std430, set = 0, binding = 3) buffer BVHBuffer { LinearBVHNode nodes[]; } bvhBuf;
+
+layout(std140, set = 0, binding = 4) uniform CameraUBO {
+    vec3 origin;
+// 4 byte padding (std140'da vec3 -> 16 byte align)
+    vec3 lower_left_corner;
+// 4 byte padding
+    vec3 horizontal;
+// 4 byte padding
+    vec3 vertical;
+} cam;
+
+// --- Push Constants ---
+layout(push_constant) uniform Constants {
+    int numTriangles;
+} constants;
+
+// --- Sabitler ---
+const float T_MIN = 0.001;
+const float T_MAX = 10000.0;
+const int   MAX_BOUNCES = 10; // Işın sekme limiti
+const float MAT_LAMBERTIAN = 0.0;
+const float MAT_METAL      = 1.0;
+const float MAT_METAL_FUZZY= 2.0;
+
+// --- Rastgele Sayı Üretici (RNG) ---
+uint seed;
+
+uint pcg(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randomFloat() {
+    seed = pcg(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+vec3 randomVec3InUnitSphere() {
+    vec3 temp = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
+    for(;;) {
+        vec3 p = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
+        if (dot(p, p) < 1.0) return p;
+    }
+    return temp;
+}
+
+vec3 randomUnitVector() {
+    return normalize(randomVec3InUnitSphere());
+}
+
+// --- Yardımcı Fonksiyonlar ---
+vec3 ray_at(Ray r, float t) {
+    return r.origin + r.dir * t;
+}
+
+vec3 getSkyColor(Ray r) {
+    vec3 unit_direction = normalize(r.dir);
+    float t = 0.5 * (unit_direction.y + 1.0);
+    return (1.0 - t) * vec3(1.0) + t * vec3(0.5, 0.7, 1.0);
+}
+
+// --- Çarpışma Testleri ---
+bool hit_aabb(Ray r, vec3 bbox_min, vec3 bbox_max, float t_min, float t_max) {
+    vec3 invDir = 1.0 / r.dir;
+    vec3 t0s = (bbox_min - r.origin) * invDir;
+    vec3 t1s = (bbox_max - r.origin) * invDir;
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+
+    // İç içe max/min çağrılarını ayır
+    float t_enter = max(tmin.x, tmin.y);
+    t_enter = max(t_enter, tmin.z);
+
+    float t_exit = min(tmax.x, tmax.y);
+    t_exit = min(t_exit, tmax.z);
+
+    return t_exit > t_enter && t_exit > t_min && t_enter < t_max;
+}
+
+bool hit_triangle(Ray r, vec3 v0, vec3 v1, vec3 v2, inout float closest_t, out vec3 hit_normal) {
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 ray_cross_e2 = cross(r.dir, edge2);
+    float det = dot(edge1, ray_cross_e2);
+    if (det > -0.00001 && det < 0.00001) return false;
+
+    float inv_det = 1.0 / det;
+    vec3 s = r.origin - v0;
+    float u = inv_det * dot(s, ray_cross_e2);
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 s_cross_e1 = cross(s, edge1);
+    float v = inv_det * dot(r.dir, s_cross_e1);
+    if (v < 0.0 || (u + v) > 1.0) return false;
+
+    float t = inv_det * dot(edge2, s_cross_e1);
+    if (t > T_MIN && t < closest_t) {
+        closest_t = t;
+        hit_normal = normalize(cross(edge1, edge2));
+        if (dot(r.dir, hit_normal) > 0.0) hit_normal = -hit_normal;
+        return true;
+    }
+    return false;
+}
+
+// --- Materyal (Scatter) Fonksiyonu ---
+bool scatter(Ray r_in, int mat_index, vec3 hit_pos, vec3 hit_normal,
+out vec3 attenuation, out Ray scattered) {
+
+    Material mat = matBuf.materials[mat_index];
+
+    if (mat.type == MAT_LAMBERTIAN) {
+        vec3 scatter_direction = hit_normal + randomUnitVector();
+        if (length(scatter_direction) < 0.0001) scatter_direction = hit_normal;
+        scattered   = Ray(hit_pos, normalize(scatter_direction));
+        attenuation = mat.albedo;
+        return true;
+    }
+
+    if (mat.type == MAT_METAL || mat.type == MAT_METAL_FUZZY) {
+        float fuzz    = (mat.type == MAT_METAL_FUZZY) ? 0.3 : 0.0;
+        vec3 reflected= reflect(normalize(r_in.dir), hit_normal); // yerleşik reflect kullanılıyor
+        scattered     = Ray(hit_pos, normalize(reflected + fuzz * randomVec3InUnitSphere()));
+        attenuation   = mat.albedo;
+        return (dot(scattered.dir, hit_normal) > 0.0);
+    }
+
+    return false; // Bilinmeyen materyal
+}
+
+// --- ANA SHADER (MAIN) ---
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 image_size   = imageSize(resultImage);
+    if (pixel_coords.x >= image_size.x || pixel_coords.y >= image_size.y) return;
+
+    // RNG Seed
+    seed = (pixel_coords.y * image_size.x + pixel_coords.x);
+
+    // Anti-Aliasing (Y-flip ile)
+    float u = (float(pixel_coords.x) + randomFloat()) / float(image_size.x);
+    float v = (float(image_size.y - 1 - pixel_coords.y) + randomFloat()) / float(image_size.y);
+
+    // Kamera Işını
+    Ray r;
+    r.origin = cam.origin;
+    r.dir = normalize(cam.lower_left_corner + cam.horizontal * u + cam.vertical * v - cam.origin);
+
+    // Path Tracing
+    vec3 final_color = vec3(0.0);
+    vec3 attenuation = vec3(1.0);
+
+    for (int b = 0; b < MAX_BOUNCES; b++) {
+
+        float closest_t = T_MAX;
+        int   hit_triangle_index = -1;
+        vec3  hit_normal = vec3(0.0);
+
+        int stack[64];
+        int stackPtr = 0;
+        stack[stackPtr++] = 0; // root
+
+        while (stackPtr > 0) {
+            int nodeIndex = stack[--stackPtr];
+            LinearBVHNode node = bvhBuf.nodes[nodeIndex];
+
+            if (hit_aabb(r, node.bbox_min, node.bbox_max, T_MIN, closest_t)) {
+                if (node.count < 0) { // yaprak
+                    int triangleIndex = -(node.data + 1);
+                    vec3 v0 = triBuf.vertices[triangleIndex * 3 + 0].pos;
+                    vec3 v1 = triBuf.vertices[triangleIndex * 3 + 1].pos;
+                    vec3 v2 = triBuf.vertices[triangleIndex * 3 + 2].pos;
+
+                    vec3 temp_normal;
+                    if (hit_triangle(r, v0, v1, v2, closest_t, temp_normal)) {
+                        hit_triangle_index = triangleIndex;
+                        hit_normal = temp_normal;
+                    }
+                } else { // iç düğüm
+                    stack[stackPtr++] = node.count; // right
+                    stack[stackPtr++] = node.data;  // left
+                }
+            }
+        }
+
+        if (hit_triangle_index != -1) {
+            vec3 hit_pos = ray_at(r, closest_t);
+            vec3 mat_attenuation;
+            Ray  scattered_ray;
+
+            if (scatter(r, hit_triangle_index, hit_pos, hit_normal, mat_attenuation, scattered_ray)) {
+                attenuation *= mat_attenuation;
+                r = scattered_ray;
+            } else {
+                attenuation = vec3(0.0);
+                break;
+            }
+        } else {
+            final_color = attenuation * getSkyColor(r);
+            break;
+        }
+
+        if (b == MAX_BOUNCES - 1) {
+            final_color = vec3(0.0);
+        }
+    }
+
+    // Renk Yazma (Gamma ~ sqrt)
+    final_color = sqrt(final_color);
+    imageStore(resultImage, pixel_coords, vec4(final_color, 1.0));
+}

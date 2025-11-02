@@ -23,6 +23,6 @@ public class Ray {
      * @return The point in 3D space.
      */
     public Vec3 at(double t) {
-        return origin.add(direction.mul(t));
+        return origin.add(direction.multiply(t));
     }
 }

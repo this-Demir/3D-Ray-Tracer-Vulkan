@@ -3,114 +3,89 @@ package dev.demir.vulkan.scene;
 import dev.demir.vulkan.util.Vec3;
 
 /**
- * Sahnedeki sanal kamerayı temsil eder.
- * Pozisyonuna (origin) ve yönelimine (lookAt) göre viewport
- * vektörlerini (lower-left, horizontal, vertical) hesaplar.
- *
- * Bu veri, compute shader tarafından kullanılmak üzere bir
- * Uniform Buffer Object (UBO) aracılığıyla GPU'ya gönderilir.
- *
- * [cite_start]Hesaplama mantığı, compute.comp [cite: 1, 91-97] içindeki orijinal
- * [cite_start]hardcoded değerlere ve raytracer-java [cite: 2, 1-52] ilkelerine dayanmaktadır.
+ * Advanced Phase 2.5: Updated Camera
+ * This class now calculates the viewport vectors (lower_left_corner,
+ * horizontal, vertical) that the 'raytracer-in-one-weekend' style
+ * shader (the one you provided) expects.
  */
 public class Camera {
 
-    // --- UBO için Önbelleğe Alınan Vektörler ---
-    // Bunlar GPU'ya gönderilen nihai değerlerdir.
+    // --- Mevcut Durum ---
     private Vec3 origin;
-    private Vec3 lowerLeft;
+    private Vec3 lookAt;
+    private Vec3 vUp;
+    private double vfov; // vertical field-of-view in degrees
+    private double aspect_ratio;
+
+    // --- YENİ: Shader'ın İhtiyaç Duyduğu Hesaplanmış Vektörler ---
+    private Vec3 lower_left_corner;
     private Vec3 horizontal;
     private Vec3 vertical;
 
-    // --- Kamera Durum Özellikleri ---
-    // Bunlar UBO vektörlerini yeniden hesaplamak için kullanılır
-    private Vec3 lookAt;
-    private final Vec3 vUp;
-    private final double vfov; // Derece cinsinden dikey görüş alanı
-    private final double aspectRatio;
-    private final double focusDist;
-
-    /**
-     * Yeni bir dinamik kamera oluşturur.
-     *
-     * @param origin      Kamera pozisyonu
-     * @param lookAt      Kameranın baktığı nokta
-     * @param vUp         Kamera için "yukarı" yönü (örn: (0, 1, 0))
-     * @param vfov        Dikey görüş alanı (derece cinsinden)
-     * @param aspectRatio En-boy oranı (genişlik / yükseklik)
-     */
-    public Camera(Vec3 origin, Vec3 lookAt, Vec3 vUp, double vfov, double aspectRatio) {
+    public Camera(Vec3 origin, Vec3 lookAt, Vec3 vUp, double vfov, double aspect_ratio) {
         this.origin = origin;
         this.lookAt = lookAt;
         this.vUp = vUp;
         this.vfov = vfov;
-        this.aspectRatio = aspectRatio;
-        this.focusDist = 10.0; // compute.comp [cite: 1, 95] içindeki hardcoded focus_dist ile eşleşir
+        this.aspect_ratio = aspect_ratio;
 
-        recalculate();
+        // Kamerayı oluştururken bu değerleri hesapla
+        recalculateViewport();
     }
 
     /**
-     * Kameranın mevcut durumuna (origin, lookAt, vb.) göre viewport
-     * vektörlerini (horizontal, vertical, lowerLeft) yeniden hesaplar.
-     * [cite_start]Bu mantık doğrudan compute.comp [cite: 1, 91-97] dosyasından alınmıştır.
+     * NEW: Calculates the viewport vectors based on the camera's state.
      */
-    private void recalculate() {
-        double theta = Math.toRadians(this.vfov);
+    private void recalculateViewport() {
+        double theta = Math.toRadians(vfov);
         double h = Math.tan(theta / 2.0);
-        double viewportHeight = 2.0 * h;
-        double viewportWidth = this.aspectRatio * viewportHeight;
+        double viewport_height = 2.0 * h;
+        double viewport_width = aspect_ratio * viewport_height;
 
-        // Standart "lookAt" kamera modelini takip eder
-        Vec3 w = origin.sub(lookAt).normalize();
-
-        Vec3 u = Vec3.cross(vUp, w).normalize();
+        // Kameranın 3D eksenlerini hesapla (u, v, w)
+        // w: Kameranın baktığı yönün tersi (Z ekseni)
+        Vec3 w = Vec3.unitVector(origin.sub(lookAt));
+        // u: Kameranın "sağ" vektörü (X ekseni)
+        Vec3 u = Vec3.unitVector(Vec3.cross(vUp, w));
+        // v: Kameranın "yukarı" vektörü (Y ekseni)
         Vec3 v = Vec3.cross(w, u);
 
-        this.horizontal = u.mul(viewportWidth).mul(focusDist);
-        this.vertical = v.mul(viewportHeight).mul(focusDist);
-        this.lowerLeft = origin.sub(horizontal.div(2.0))
+        // Viewport'u (görüş alanı) oluşturan vektörleri hesapla
+        this.horizontal = u.multiply(viewport_width);
+        this.vertical = v.multiply(viewport_height);
+
+        // Viewport'un sol alt köşesini hesapla
+        // origin - (horizontal/2) - (vertical/2) - w
+        this.lower_left_corner = origin
+                .sub(horizontal.div(2.0))
                 .sub(vertical.div(2.0))
-                .sub(w.mul(focusDist));
+                .sub(w);
+
+        // Orijini de güncellememiz gerekiyor (bu modelde origin sabittir)
+        // Not: Bu hesaplama 'origin'i değiştirmez, sadece LL köşe için kullanır.
     }
 
-    // --- VulkanEngine UBO için Getters ---
-    // Bunlar VulkanEngine tarafından GPU tamponunu güncellemek için çağrılır.
+    // --- Getters (Shader'ın ihtiyacı olanlar) ---
+
+    public Vec3 getLowerLeft() { return lower_left_corner; }
+    public Vec3 getHorizontal() { return horizontal; }
+    public Vec3 getVertical() { return vertical; }
+
+
+    // --- Setters (Kamerayı hareket ettirmek için) ---
 
     public Vec3 getOrigin() {
         return origin;
     }
 
-    public Vec3 getLowerLeft() {
-        return lowerLeft;
-    }
-
-    public Vec3 getHorizontal() {
-        return horizontal;
-    }
-
-    public Vec3 getVertical() {
-        return vertical;
-    }
-
-    // --- UI Kontrolleri için Setters ---
-    // Bunlar VulkanApp (Swing UI) tarafından bir tuşa basıldığında çağrılır.
-
     /**
-     * Kameranın pozisyonunu (origin) ayarlar ve viewport'u yeniden hesaplar.
-     * @param newOrigin Kameranın yeni (x, y, z) pozisyonu.
+     * Kameranın pozisyonunu günceller ve viewport'u yeniden hesaplar.
      */
-    public void setOrigin(Vec3 newOrigin) {
-        this.origin = newOrigin;
-        recalculate(); // Pozisyon değiştiğinde viewport vektörleri güncellenmelidir
+    public void setOrigin(Vec3 origin) {
+        this.origin = origin;
+        // Kamera hareket ettiğinde, viewport'u yeniden hesaplamamız gerekir!
+        recalculateViewport();
     }
 
-    /**
-     * Kameranın baktığı noktayı ayarlar ve viewport'u yeniden hesaplar.
-     * @param newLookAt Yeni (x, y, z) hedef.
-     */
-    public void setLookAt(Vec3 newLookAt) {
-        this.lookAt = newLookAt;
-        recalculate();
-    }
+    // (Gelecekte lookAt'i de güncelleyebiliriz, şimdilik bu yeterli)
 }

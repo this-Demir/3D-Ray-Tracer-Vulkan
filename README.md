@@ -1,7 +1,3 @@
-# Vulkan BVH Ray Tracer
-
-This project is a high-performance ray tracer written in Java using Vulkan (via LWJGL). It uses a Bounding Volume Hierarchy (BVH) to accelerate ray-triangle intersections, achieving O(log n) performance.
-
 
 # Vulkan BVH Ray Tracer
 

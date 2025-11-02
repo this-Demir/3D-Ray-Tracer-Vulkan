@@ -23,17 +23,17 @@ import static org.lwjgl.vulkan.VK10.*;
 
 /**
  * "Phase 1: Refactor Engine"
- * Bu sınıf, VulkanApp.java'dan  yeniden düzenlenen "aptal" render motorudur.
- * TÜM Vulkan mantığını içerir ancak iş parçacığı (thread) yönetimi yapmaz.
+ * This class is the refactored "dumb" renderer extracted from VulkanApp.java.
+ * It contains ALL Vulkan logic but does not manage threads.
  *
- * Thread-safe DEĞİLDİR ve SADECE RenderLoop (VRT) tarafından çağrılmalıdır.
+ * It is NOT thread-safe and MUST be called only by the RenderLoop (VRT).
  */
 public class VulkanRenderer {
 
-    // --- Configuration (Artık RenderLoop'tan alınabilir, şimdilik sabit) ---
+    // --- Configuration (Could be provided by RenderLoop later; hard-coded for now) ---
     private static final int WIDTH = 1280;
     private static final int HEIGHT = 720;
-    private static final String SHADER_PATH = "shaders_spv/compute.spv";
+    private static final String SHADER_PATH = "shaders_spv/compute_dynamic_ray.spv";
     private static final boolean ENABLE_VALIDATION_LAYERS = true;
 
     // --- Vulkan Core Objects ---
@@ -74,7 +74,7 @@ public class VulkanRenderer {
     }
 
     /**
-     * Motoru başlatır (VulkanApp.initVulkan()  [cite: 3, 294-306])
+     * Initializes the engine (equivalent to VulkanApp.initVulkan()  [cite: 3, 294-306]).
      */
     public void init() {
         System.out.println("LOG (VRT): Initializing Vulkan...");
@@ -86,11 +86,11 @@ public class VulkanRenderer {
         pickPhysicalDevice();
         createLogicalDevice();
 
-        // Pipeline için gerekli diğer kaynakları oluştur
+        // Create other resources required by the pipeline
         try (MemoryStack stack = stackPush()) {
             createComputeImage(stack);
             createStagingBuffer(stack);
-            // Sahneye özel tamponlar (triangle, bvh, vb.) uploadAndSwapScene tarafından oluşturulacak
+            // Scene-specific buffers (triangles, BVH, etc.) will be created by uploadAndSwapScene
             createComputePipelineResources(stack);
             createCommandPoolAndBuffer(stack);
             createFence(stack);
@@ -99,61 +99,76 @@ public class VulkanRenderer {
     }
 
     /**
-     * Yeni CPU verisini (BuiltCpuData) alır, GPU'ya yükler,
-     * ve yeni GpuSceneData nesnesini döndürür.
+     * Takes new CPU data (BuiltCpuData), uploads it to the GPU,
+     * and returns a new GpuSceneData instance.
      *
-     * ÖNEMLİ: Bu metod, eski GpuSceneData'yı SİLMEZ.
-     * Bu, RenderLoop'un sorumluluğundadır.
+     * IMPORTANT: This method does NOT destroy the old GpuSceneData.
+     * That is the responsibility of the RenderLoop.
      */
     public GpuSceneData uploadAndSwapScene(BuiltCpuData cpuData) {
         System.out.println("LOG (VRT): Uploading new scene data to GPU...");
 
-        // RenderLoop.checkQueues() içinden buraya taşındı.
-        // Yeni tamponları yüklemeden önce GPU'nun boşta olduğundan emin ol.
+        // Moved here from RenderLoop.checkQueues().
+        // Ensure the GPU is idle before uploading new buffers.
         vkDeviceWaitIdle(device);
 
         try (MemoryStack stack = stackPush()) {
-            // ... (Metodun geri kalanı bir önceki cevaptaki gibi) ...
-            // ... (createHostVisibleBuffer çağrıları) ...
-
             long triangleBuffer, triangleBufferMemory;
             long materialBuffer, materialBufferMemory;
             long bvhBuffer, bvhBufferMemory;
 
-            // 1. Üçgen Tamponunu Yükle
+            // 1. Upload Triangle Buffer
             if (cpuData.modelVertexData == null) throw new RuntimeException("Model vertex data was not prepared!");
             long triBufferSize = cpuData.modelVertexData.remaining() * 4L;
             LongBuffer pTriBuffer = stack.mallocLong(1);
             LongBuffer pTriMemory = stack.mallocLong(1);
-            createHostVisibleBuffer(stack, triBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    memByteBuffer(cpuData.modelVertexData), pTriBuffer, pTriMemory);
+            createHostVisibleBuffer(
+                    stack,
+                    triBufferSize,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    memByteBuffer(cpuData.modelVertexData),
+                    pTriBuffer,
+                    pTriMemory
+            );
             triangleBuffer = pTriBuffer.get(0);
             triangleBufferMemory = pTriMemory.get(0);
-            memFree(cpuData.modelVertexData); // CPU verisini serbest bırak
+            memFree(cpuData.modelVertexData); // Release CPU-side data
 
-            // 2. Materyal Tamponunu Yükle
+            // 2. Upload Material Buffer
             if (cpuData.modelMaterialData == null) throw new RuntimeException("Model material data was not prepared!");
             long matBufferSize = cpuData.modelMaterialData.remaining() * 4L;
             LongBuffer pMatBuffer = stack.mallocLong(1);
             LongBuffer pMatMemory = stack.mallocLong(1);
-            createHostVisibleBuffer(stack, matBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    memByteBuffer(cpuData.modelMaterialData), pMatBuffer, pMatMemory);
+            createHostVisibleBuffer(
+                    stack,
+                    matBufferSize,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    memByteBuffer(cpuData.modelMaterialData),
+                    pMatBuffer,
+                    pMatMemory
+            );
             materialBuffer = pMatBuffer.get(0);
             materialBufferMemory = pMatMemory.get(0);
-            memFree(cpuData.modelMaterialData); // CPU verisini serbest bırak
+            memFree(cpuData.modelMaterialData); // Release CPU-side data
 
-            // 3. BVH Tamponunu Yükle
+            // 3. Upload BVH Buffer
             if (cpuData.flatBvhData == null) throw new RuntimeException("BVH data was not flattened!");
             long bvhBufferSize = cpuData.flatBvhData.remaining();
             LongBuffer pBvhBuffer = stack.mallocLong(1);
             LongBuffer pBvhMemory = stack.mallocLong(1);
-            createHostVisibleBuffer(stack, bvhBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    cpuData.flatBvhData, pBvhBuffer, pBvhMemory);
+            createHostVisibleBuffer(
+                    stack,
+                    bvhBufferSize,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    cpuData.flatBvhData,
+                    pBvhBuffer,
+                    pBvhMemory
+            );
             bvhBuffer = pBvhBuffer.get(0);
             bvhBufferMemory = pBvhMemory.get(0);
-            // flatBvhData (ByteBuffer) memFree GEREKTİRMEZ
+            // flatBvhData (ByteBuffer) does NOT require memFree
 
-            // 4. Descriptor Set'i yeni tamponlarla güncelle
+            // 4. Update the descriptor set with the new buffers
             updateDescriptorSet(stack, triangleBuffer, materialBuffer, bvhBuffer);
 
             System.out.println("LOG (VRT): New scene uploaded. Triangles: " + cpuData.triangleCount);
@@ -168,34 +183,34 @@ public class VulkanRenderer {
     }
 
     /**
-     * VRT üzerinde ana render döngüsü.
-     * Verilen sahne verisiyle bir kare (frame) render eder.
-     * Piksel verisini içeren bir ByteBuffer döndürür.
+     * Main render call on the VRT.
+     * Renders one frame using the given scene data.
+     * Returns a ByteBuffer that contains pixel data.
      */
     public ByteBuffer renderFrame(GpuSceneData sceneData) {
         try (MemoryStack stack = stackPush()) {
-            // Komutları kaydet (VulkanApp.recordComputeCommands  [cite: 3, 853-977])
+            // Record commands (equivalent to VulkanApp.recordComputeCommands  [cite: 3, 853-977])
             recordComputeCommands(stack, sceneData.triangleBuffer, sceneData.materialBuffer, sceneData.bvhBuffer, sceneData.triangleCount);
 
-            // Komutları gönder (VulkanApp.submitCommands  [cite: 3, 979-992])
+            // Submit commands (equivalent to VulkanApp.submitCommands  [cite: 3, 979-992])
             VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
                     .pCommandBuffers(stack.pointers(commandBuffer));
 
-            vkResetFences(device, fence); // Fence'i sıfırla
+            vkResetFences(device, fence); // Reset the fence
 
             vkQueueSubmit(computeQueue, submitInfo, fence);
 
             vkWaitForFences(device, fence, true, Long.MAX_VALUE);
 
-            // Görüntüyü oku (VulkanApp.saveImageToFile  [cite: 3, 994-1008])
+            // Read image (equivalent to VulkanApp.saveImageToFile  [cite: 3, 994-1008])
             long bufferSize = WIDTH * HEIGHT * 4;
             PointerBuffer pData = stack.mallocPointer(1);
             vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, pData);
             ByteBuffer pixelData = pData.getByteBuffer(0, (int) bufferSize);
 
-            // ÖNEMLİ: Kopyasını oluştur. Aksi halde pData unmap olduğunda bu buffer geçersiz olur.
-            ByteBuffer copyPixelData = ByteBuffer.allocateDirect((int)bufferSize);
+            // IMPORTANT: Make a copy; otherwise this buffer becomes invalid after unmap.
+            ByteBuffer copyPixelData = ByteBuffer.allocateDirect((int) bufferSize);
             copyPixelData.put(pixelData);
             copyPixelData.flip();
 
@@ -206,13 +221,13 @@ public class VulkanRenderer {
     }
 
     /**
-     * Eski, artık kullanılmayan GPU tamponlarını güvenle yok eder.
+     * Safely destroys old, now-unused GPU buffers.
      */
     public void destroyGpuSceneData(GpuSceneData oldData) {
         if (oldData == null) return;
 
         System.out.println("LOG (VRT): Destroying old GPU scene data...");
-        // vkDeviceWaitIdle zaten RenderLoop'ta çağrılmış olmalı
+        // vkDeviceWaitIdle should already have been called in the RenderLoop
         vkDestroyBuffer(device, oldData.triangleBuffer, null);
         vkFreeMemory(device, oldData.triangleBufferMemory, null);
         vkDestroyBuffer(device, oldData.materialBuffer, null);
@@ -222,7 +237,7 @@ public class VulkanRenderer {
     }
 
     /**
-     * Motoru kapatır (VulkanApp.cleanup  [cite: 3, 1060-1135])
+     * Shuts down the engine (equivalent to VulkanApp.cleanup  [cite: 3, 1060-1135]).
      */
     public void destroy() {
         System.out.println("LOG (VRT): Cleaning up VulkanRenderer...");
@@ -234,7 +249,7 @@ public class VulkanRenderer {
             }
         }
 
-        // GpuSceneData (triangle/material/bvh buffer'ları) RenderLoop'ta temizlenmeli
+        // GpuSceneData (triangle/material/bvh buffers) should be cleaned up in the RenderLoop
 
         if (fence != VK_NULL_HANDLE) {
             vkDestroyFence(device, fence, null);
@@ -288,7 +303,7 @@ public class VulkanRenderer {
     }
 
 
-    // --- 1. Başlatma Metodları (VulkanApp'tan  taşındı) ---
+    // --- 1. Initialization Methods (moved over from VulkanApp) ---
     // ... (createInstance, setupDebugMessenger, pickPhysicalDevice, etc.) ...
 
     private void createInstance() {
@@ -415,11 +430,11 @@ public class VulkanRenderer {
     }
 
 
-    // --- 2. Kaynak Oluşturma Metodları (VulkanApp'tan  taşındı) ---
+    // --- 2. Resource Creation Methods (moved over from VulkanApp) ---
     // ... (createComputeImage, createStagingBuffer, etc.) ...
 
     private void createComputeImage(MemoryStack stack) {
-        // (VulkanApp.java:502'den  [cite: 3, 502-540] farksız)
+        // Unchanged from VulkanApp.java:502  [cite: 3, 502-540]
         VkImageCreateInfo imageInfo = VkImageCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
                 .imageType(VK_IMAGE_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM)
@@ -451,7 +466,7 @@ public class VulkanRenderer {
     }
 
     private void createStagingBuffer(MemoryStack stack) {
-        // (VulkanApp.java:542'den  [cite: 3, 542-566] farksız)
+        // Unchanged from VulkanApp.java:542  [cite: 3, 542-566]
         long bufferSize = WIDTH * HEIGHT * 4;
         VkBufferCreateInfo bufferInfo = VkBufferCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
@@ -474,13 +489,13 @@ public class VulkanRenderer {
         vkBindBufferMemory(device, stagingBuffer, stagingBufferMemory, 0);
     }
 
-    // createTriangleBuffer, createMaterialBuffer, createBvhBuffer metodları
-    // uploadAndSwapScene içine taşındı.
+    // createTriangleBuffer, createMaterialBuffer, createBvhBuffer
+    // were moved into uploadAndSwapScene.
 
     private void createHostVisibleBuffer(MemoryStack stack, long bufferSize, int usage,
-                                         ByteBuffer data, // Veri (ByteBuffer)
+                                         ByteBuffer data, // Source data (ByteBuffer)
                                          LongBuffer pBuffer, LongBuffer pMemory) {
-        // (VulkanApp.java:676'dan  [cite: 3, 676-696] farksız)
+        // Unchanged from VulkanApp.java:676  [cite: 3, 676-696]
         createBuffer(stack, bufferSize, usage,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                 pBuffer, pMemory);
@@ -495,7 +510,7 @@ public class VulkanRenderer {
 
     private void createBuffer(MemoryStack stack, long size, int usage, int properties,
                               LongBuffer pBuffer, LongBuffer pMemory) {
-        // (VulkanApp.java:708'den  [cite: 3, 708-732] farksız)
+        // Unchanged from VulkanApp.java:708  [cite: 3, 708-732]
         VkBufferCreateInfo bufferInfo = VkBufferCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
                 .size(size)
@@ -520,13 +535,13 @@ public class VulkanRenderer {
     }
 
     /**
-     * Pipeline, Layout ve Descriptor Pool'u oluşturur.
-     * Bu kaynaklar sahne değiştikçe değişmez.
+     * Creates the Pipeline, Layout and Descriptor Pool.
+     * These resources do not change when the scene changes.
      */
     private void createComputePipelineResources(MemoryStack stack) {
-        // (VulkanApp.java:745'den  [cite: 3, 745-848] alındı, ama DescriptorSet ayırma ve güncelleme ÇIKARILDI)
+        // Based on VulkanApp.java:745  [cite: 3, 745-848], but descriptor set allocation/update moved.
 
-        // --- Create Descriptor Set Layout (for 4 bindings) ---
+        // --- Create Descriptor Set Layout (4 bindings) ---
         VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(4, stack);
         bindings.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
@@ -544,7 +559,7 @@ public class VulkanRenderer {
         vkCreateDescriptorSetLayout(device, layoutInfo, null, pSetLayout);
         descriptorSetLayout = pSetLayout.get(0);
 
-        // --- Create Pipeline Layout  ---
+        // --- Create Pipeline Layout ---
         VkPushConstantRange.Buffer pushConstantRange = VkPushConstantRange.calloc(1, stack)
                 .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(4); // int numTriangles
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
@@ -555,7 +570,7 @@ public class VulkanRenderer {
         vkCreatePipelineLayout(device, pipelineLayoutInfo, null, pPipelineLayout);
         pipelineLayout = pPipelineLayout.get(0);
 
-        // --- Create Pipeline  ---
+        // --- Create Pipeline ---
         try {
             computeShaderModule = createShaderModule(loadShaderFromFile(SHADER_PATH));
         } catch (IOException e) {
@@ -574,23 +589,23 @@ public class VulkanRenderer {
         vkCreateComputePipelines(device, VK_NULL_HANDLE, pipelineInfo, null, pComputePipeline);
         computePipeline = pComputePipeline.get(0);
 
-        // --- Create Descriptor Pool  ---
+        // --- Create Descriptor Pool ---
         VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
         poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
-        // Pool'u biraz büyük yapalım ki sahne değişimlerinde sorun olmasın (örn: 10 set)
+        // Slightly larger to handle multiple scene swaps (e.g., 10 sets-worth of buffers)
         poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(3 * 10);
 
         VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
-                .flags(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT) // Gerekebilir
+                .flags(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT) // May be needed
                 .pPoolSizes(poolSizes)
-                .maxSets(10); // 10 sahne değişimine izin ver
+                .maxSets(10); // Allow up to 10 scene changes
         LongBuffer pDescriptorPool = stack.mallocLong(1);
         vkCreateDescriptorPool(device, poolInfo, null, pDescriptorPool);
         descriptorPool = pDescriptorPool.get(0);
 
         // --- Allocate Descriptor Set ---
-        // Descriptor Set burada *AYRILIR*, ama updateDescriptorSet() içinde *GÜNCELLENİR*.
+        // The descriptor set is allocated here, but updated later in updateDescriptorSet().
         VkDescriptorSetAllocateInfo allocSetInfo = VkDescriptorSetAllocateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
                 .descriptorPool(descriptorPool)
@@ -601,7 +616,7 @@ public class VulkanRenderer {
     }
 
     /**
-     * Ayrılmış olan ana descriptorSet'i YENİ tamponlarla günceller.
+     * Updates the allocated main descriptor set with NEW buffers.
      */
     private void updateDescriptorSet(MemoryStack stack, long triangleBuffer, long materialBuffer, long bvhBuffer) {
         VkDescriptorImageInfo.Buffer imageDescriptor = VkDescriptorImageInfo.calloc(1, stack)
@@ -633,7 +648,7 @@ public class VulkanRenderer {
 
 
     private void createCommandPoolAndBuffer(MemoryStack stack) {
-        // (VulkanApp.java:853'den  [cite: 3, 853-868] farksız)
+        // Unchanged from VulkanApp.java:853  [cite: 3, 853-868]
         VkCommandPoolCreateInfo cmdPoolInfo = VkCommandPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
                 .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
@@ -659,12 +674,12 @@ public class VulkanRenderer {
     }
 
     /**
-     * renderFrame() içinde çağrılır.
+     * Called inside renderFrame().
      */
     private void recordComputeCommands(MemoryStack stack, long triangleBuffer, long materialBuffer, long bvhBuffer, int triangleCount) {
-        // (VulkanApp.java:873'den  [cite: 3, 873-977] alındı)
+        // Based on VulkanApp.java:873  [cite: 3, 873-977]
 
-        vkResetCommandBuffer(commandBuffer, 0); // Komut tamponunu sıfırla
+        vkResetCommandBuffer(commandBuffer, 0); // Reset the command buffer
 
         VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
@@ -672,7 +687,7 @@ public class VulkanRenderer {
 
         vkBeginCommandBuffer(commandBuffer, beginInfo);
 
-        // 1. Barrier: Transition Image from UNDEFINED -> GENERAL
+        // 1. Barrier: ensure the image is in GENERAL layout before compute writes
         VkImageMemoryBarrier.Buffer imageBarrier1 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .srcAccessMask(0).dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
@@ -682,9 +697,8 @@ public class VulkanRenderer {
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         imageBarrier1.srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
 
-        // 1b. Buffer'lar için barrier'a gerek yok, çünkü descriptor set'i güncelledik
-        // ve komut göndermeden önce host (CPU) yazmasının bittiği garanti.
-        // Eğer aynı tamponları *yeniden* kullansaydık gerekirdi.
+        // 1b. No buffer barriers needed here: descriptor set was just updated
+        // and we guarantee the host (CPU) writes have completed before submission.
 
         vkCmdPipelineBarrier(commandBuffer,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -695,15 +709,15 @@ public class VulkanRenderer {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
 
-        // 3. Send Push Constant (number of triangles)
+        // 3. Push Constant (number of triangles)
         ByteBuffer pushConstantData = stack.malloc(4);
         pushConstantData.putInt(0, triangleCount);
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantData);
 
-        // 4. Dispatch the shader
+        // 4. Dispatch
         vkCmdDispatch(commandBuffer, (WIDTH + 7) / 8, (HEIGHT + 7) / 8, 1);
 
-        // 5. Barrier: Transition Image from GENERAL -> TRANSFER_SRC_OPTIMAL (for copying)
+        // 5. Barrier: GENERAL -> TRANSFER_SRC_OPTIMAL (for copying to buffer)
         VkImageMemoryBarrier.Buffer imageBarrier2 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT)
@@ -727,29 +741,29 @@ public class VulkanRenderer {
 
         vkCmdCopyImageToBuffer(commandBuffer, computeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, region);
 
-        // 7. Barrier: Görüntüyü bir sonraki kare için tekrar GENERAL'e çevir
+        // 7. Barrier: TRANSFER_SRC_OPTIMAL -> GENERAL (prepare for next frame)
         VkImageMemoryBarrier.Buffer imageBarrier3 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
-                .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(0) // Bir sonraki kare 'top of pipe' olacak
-                .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_GENERAL) // UNDEFINED -> GENERAL
+                .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(0) // Next frame starts at top-of-pipe
+                .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         imageBarrier3.srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
 
         vkCmdPipelineBarrier(commandBuffer,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // Bir sonraki kareyi beklesin
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 0, null, null, imageBarrier3);
 
         vkEndCommandBuffer(commandBuffer);
     }
 
 
-    // --- 3. Yardımcı Metodlar (VulkanApp'tan  taşındı) ---
+    // --- 3. Helper Methods (moved over from VulkanApp) ---
     // ... (findMemoryType, loadShaderFromFile, createShaderModule) ...
 
     private int findMemoryType(int typeFilter, int properties) {
-        // (VulkanApp.java:1010'dan  [cite: 3, 1010-1021] farksız)
+        // Unchanged from VulkanApp.java:1010  [cite: 3, 1010-1021]
         try (MemoryStack stack = stackPush()) {
             VkPhysicalDeviceMemoryProperties memProperties = VkPhysicalDeviceMemoryProperties.malloc(stack);
             vkGetPhysicalDeviceMemoryProperties(physicalDevice, memProperties);
@@ -762,7 +776,7 @@ public class VulkanRenderer {
         throw new RuntimeException("Failed to find suitable memory type!");
     }
     private ByteBuffer loadShaderFromFile(String filepath) throws IOException {
-        // (VulkanApp.java:1022'den  [cite: 3, 1022-1031] farksız)
+        // Unchanged from VulkanApp.java:1022  [cite: 3, 1022-1031]
         try (FileInputStream fis = new FileInputStream(filepath);
              FileChannel fc = fis.getChannel()) {
             ByteBuffer buffer = ByteBuffer.allocateDirect((int) fc.size());
@@ -771,7 +785,7 @@ public class VulkanRenderer {
         }
     }
     private long createShaderModule(ByteBuffer spirvCode) {
-        // (VulkanApp.java:1032'den  [cite: 3, 1032-1044] farksız)
+        // Unchanged from VulkanApp.java:1032  [cite: 3, 1032-1044]
         try (MemoryStack stack = stackPush()) {
             VkShaderModuleCreateInfo createInfo = VkShaderModuleCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)

@@ -30,12 +30,24 @@ public class Vec3 {
         return new Vec3(x - v.x, y - v.y, z - v.z);
     }
 
-    public Vec3 mul(double t) {
+    /**
+     * Component-wise multiplication (vector * vector).
+     * NEW: Added for scaling.
+     */
+    public Vec3 multiply(Vec3 v) {
+        return new Vec3(x * v.x, y * v.y, z * v.z);
+    }
+
+    /**
+     * Scalar multiplication (vector * double).
+     * RENAMED: from mul() to multiply() for consistency.
+     */
+    public Vec3 multiply(double t) {
         return new Vec3(x * t, y * t, z * t);
     }
 
     public Vec3 div(double t) {
-        return mul(1.0 / t);
+        return multiply(1.0 / t);
     }
 
     public Vec3 negative() {

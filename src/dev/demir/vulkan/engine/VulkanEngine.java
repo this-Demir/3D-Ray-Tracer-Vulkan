@@ -1,6 +1,6 @@
-package dev.demir.vulkan.engine; // Motor için yeni bir paket
+package dev.demir.vulkan.engine; // New package for the engine
 
-// LWJGL/Vulkan importları
+// LWJGL/Vulkan imports
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
@@ -12,15 +12,15 @@ import static org.lwjgl.system.MemoryUtil.*;
 import static org.lwjgl.vulkan.EXTDebugUtils.*;
 import static org.lwjgl.vulkan.VK10.*;
 
-// 'renderer' paketimizdeki veri sınıfları
+// Data classes from our 'renderer' package
 import dev.demir.vulkan.renderer.BuiltCpuData;
 import dev.demir.vulkan.renderer.FrameData;
 import dev.demir.vulkan.renderer.GpuSceneData;
 
-// Yeni Camera sınıfımız
+// New Camera class
 import dev.demir.vulkan.scene.Camera;
 
-// Java yardımcı programları
+// Java utilities
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -32,34 +32,37 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Çekirdek Vulkan Motoru.
- * Bu sınıf Runnable arayüzünü uygular ve kendi adanmış iş parçacığında (VRT) çalışır.
- * Kendi Vulkan kaynaklarını ve yaşam döngüsünü yönetir.
- * UI iş parçacığından (Swing/EDT) gelen komutları thread-safe kuyruklar aracılığıyla alır.
- * Bu mimari, senkronizasyon sorunlarını çözer, layout hatalarını düzeltir
- * ve render mantığını UI'dan ayırır.
+ * Core Vulkan Engine.
+ * This class implements Runnable and runs on its own dedicated thread (VRT).
+ * It manages its own Vulkan resources and lifecycle.
+ * Receives commands from the UI thread (Swing/EDT) via thread-safe queues.
+ * This architecture fixes synchronization issues, layout errors,
+ * and cleanly separates rendering logic from the UI.
+ *
+ * PHASE 2.5: This engine is now fully updated to support the Camera UBO
+ * at binding = 4.
  */
 public class VulkanEngine implements Runnable {
 
-    // --- Konfigürasyon ---
+    // --- Configuration ---
     private static final int WIDTH = 1280;
     private static final int HEIGHT = 720;
-    // Kamera için UBO kullanacak yeni shader'a işaret ediyoruz
-    private static final String SHADER_PATH = "shaders_spv/compute_dynamic.spv";
+
+    // --- DÜZELTME: Shader adını konuştuğumuz adla güncelle ---
+    private static final String SHADER_PATH = "shaders_spv/compute_dynamic_ray.spv";
+
     private static final boolean ENABLE_VALIDATION_LAYERS = true;
 
-    // --- Threading ve Durum ---
+    // --- Threading & State ---
     private volatile boolean isRunning = true;
     private final Thread thread;
 
-    // --- Thread-Safe Kuyruklar (UI -> VRT Komutları) ---
-    // UI thread'i (EDT) bu kuyruklara veri *koyar*.
-    // VRT (bu sınıf) bu kuyruklardan veriyi `run()` döngüsünde *çeker*.
-    private final AtomicReference<FrameData> frameQueue; // VRT -> UI: Tamamlanan kareyi yayınlar
-    private final ConcurrentLinkedQueue<BuiltCpuData> sceneQueue;  // UI -> VRT: Yüklenecek new sahneyi gönderir
-    private final ConcurrentLinkedQueue<Camera> cameraQueue; // UI -> VRT: Kamera güncellemesini gönderir
+    // --- Thread-Safe Queues (UI -> VRT Commands) ---
+    private final AtomicReference<FrameData> frameQueue; // VRT -> UI: Publishes the completed frame
+    private final ConcurrentLinkedQueue<BuiltCpuData> sceneQueue;  // UI -> VRT: Sends a new scene to load
+    private final ConcurrentLinkedQueue<Camera> cameraQueue; // UI -> VRT: Sends camera updates
 
-    // --- Vulkan Çekirdek Nesneleri ---
+    // --- Core Vulkan Objects ---
     private VkInstance instance;
     private long debugMessenger = VK_NULL_HANDLE;
     private VkPhysicalDevice physicalDevice;
@@ -67,19 +70,23 @@ public class VulkanEngine implements Runnable {
     private VkQueue computeQueue;
     private int computeQueueFamilyIndex = -1;
 
-    // --- Compute Kaynakları ---
+    // --- Dummy Buffer for NULL descriptors ---
+    private long dummyBuffer = VK_NULL_HANDLE;
+    private long dummyBufferMemory = VK_NULL_HANDLE;
+
+    // --- Compute Resources ---
     private long computeImage = VK_NULL_HANDLE;
     private long computeImageMemory = VK_NULL_HANDLE;
     private long computeImageView = VK_NULL_HANDLE;
     private long stagingBuffer = VK_NULL_HANDLE;
     private long stagingBufferMemory = VK_NULL_HANDLE;
 
-    // --- YENİ: Kamera Uniform Buffer Object (UBO) ---
+    // --- Camera Uniform Buffer Object (UBO) ---
     private long cameraUbo = VK_NULL_HANDLE;
     private long cameraUboMemory = VK_NULL_HANDLE;
-    private ByteBuffer cameraUboMapped = null; // Hızlı güncellemeler için kalıcı olarak haritalanmış tampon
+    private ByteBuffer cameraUboMapped = null; // Persistently mapped for fast updates
 
-    // --- Pipeline Nesneleri ---
+    // --- Pipeline Objects ---
     private long computeShaderModule = VK_NULL_HANDLE;
     private long descriptorSetLayout = VK_NULL_HANDLE;
     private long pipelineLayout = VK_NULL_HANDLE;
@@ -90,10 +97,10 @@ public class VulkanEngine implements Runnable {
     private VkCommandBuffer commandBuffer;
     private long fence = VK_NULL_HANDLE;
 
-    // --- Mevcut Durum ---
+    // --- Current State ---
     private GpuSceneData currentScene = null;
 
-    // Statik Doğrulama Katmanı Kurulumu
+    // Static Validation Layer Setup
     private static final PointerBuffer VALIDATION_LAYERS;
     static {
         if (ENABLE_VALIDATION_LAYERS) {
@@ -105,8 +112,8 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * Constructor. Motoru ve iletişim kanallarını hazırlar.
-     * @param frameQueue Tamamlanan kareleri UI thread'ine yayınlamak için thread-safe referans.
+     * Constructor. Prepares the engine and its communication channels.
+     * @param frameQueue Thread-safe reference used to publish completed frames to the UI thread.
      */
     public VulkanEngine(AtomicReference<FrameData> frameQueue) {
         this.frameQueue = frameQueue;
@@ -116,10 +123,10 @@ public class VulkanEngine implements Runnable {
         this.thread.setDaemon(true);
     }
 
-    // --- PUBLIC API (UI Thread tarafından çağrılır) ---
+    // --- PUBLIC API (Called by the UI Thread) ---
 
     /**
-     * Vulkan Motor Thread'ini (VRT) başlatır.
+     * Starts the Vulkan Render Thread (VRT).
      */
     public void start() {
         this.isRunning = true;
@@ -127,40 +134,40 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * Vulkan Motor Thread'ine durma sinyali gönderir ve kapanmasını bekler.
+     * Sends a stop signal to the VRT and waits for shutdown.
      */
     public void stop() {
         this.isRunning = false;
         try {
-            this.thread.join(5000); // 5 saniye güvenli kapanma süresi
+            this.thread.join(5000); // 5s graceful shutdown window
         } catch (InterruptedException e) {
-            System.err.println("WARN (UI): VulkanEngine durdurulurken kesinti yaşandı.");
+            System.err.println("WARN (UI): Interrupted while stopping VulkanEngine.");
             Thread.currentThread().interrupt();
         }
     }
 
     /**
-     * UI thread'inin yüklenecek yeni bir sahneyi thread-safe olarak göndermesi için.
-     * Motor bu sahneyi bir sonraki uygun karede yükleyecektir.
-     * @param sceneData SceneBuilder tarafından oluşturulan CPU-tarafı verisi.
+     * Thread-safe method for the UI thread to submit a new scene to load.
+     * The engine will load it on the next suitable frame.
+     * @param sceneData CPU-side data produced by SceneBuilder.
      */
     public void submitScene(BuiltCpuData sceneData) {
         sceneQueue.add(sceneData);
     }
 
     /**
-     * UI thread'inin bir kamera güncellemesini thread-safe olarak göndermesi için.
-     * Motor bu güncellemeyi bir sonraki uygun karede UBO'ya yazacaktır.
-     * @param camera Yeni kamera durumu.
+     * Thread-safe method for the UI thread to submit a camera update.
+     * The engine will write this update into the UBO on the next suitable frame.
+     * @param camera New camera state.
      */
     public void submitCameraUpdate(Camera camera) {
         cameraQueue.add(camera);
     }
 
-    // --- VULKAN RENDER THREAD (VRT) MANTIĞI ---
+    // --- VULKAN RENDER THREAD (VRT) LOGIC ---
 
     /**
-     * Vulkan Motor Thread'i için ana giriş noktası.
+     * Main entry point for the Vulkan Render Thread.
      */
     @Override
     public void run() {
@@ -168,22 +175,22 @@ public class VulkanEngine implements Runnable {
             initVulkan();
             mainLoop();
         } catch (Exception e) {
-            System.err.println("FATAL (VRT): VulkanEngine thread'i çöktü!");
+            System.err.println("FATAL (VRT): VulkanEngine thread crashed!");
             e.printStackTrace();
             isRunning = false;
         } finally {
             cleanup();
-            System.out.println("LOG (VRT): VulkanEngine kapatıldı.");
+            System.out.println("LOG (VRT): VulkanEngine shut down.");
         }
     }
 
     /**
-     * Tüm çekirdek Vulkan bileşenlerini, pipeline'ı ve statik kaynakları başlatır.
+     * Initializes all core Vulkan components, pipeline, and static resources.
      */
     private void initVulkan() {
-        System.out.println("LOG (VRT): VulkanEngine başlatılıyor...");
+        System.out.println("LOG (VRT): Starting VulkanEngine...");
         if (!glfwInit()) {
-            throw new RuntimeException("GLFW başlatılamadı!");
+            throw new RuntimeException("GLFW could not be initialized!");
         }
 
         createInstance();
@@ -192,69 +199,66 @@ public class VulkanEngine implements Runnable {
         createLogicalDevice();
 
         try (MemoryStack stack = stackPush()) {
-            // Çekirdek kaynakları oluştur
+            // Create core resources
             createCommandPoolAndBuffer(stack);
             createFence(stack);
 
-            // Layout'a bağlı kaynakları oluştur
-            createDescriptorSetLayout(stack); // Artık Kamera UBO için binding 4 içeriyor
+            // Create resources tied to the layout
+            createDescriptorSetLayout(stack); // Now includes binding 4 for the Camera UBO
             createPipelineLayout(stack);
             createComputePipeline(stack);
 
-            // Render için kaynakları oluştur
+            // Create resources used for rendering
             createComputeImage(stack);
             createStagingBuffer(stack);
-            createCameraUbo(stack); // Yeni kamera tamponunu oluştur
+            createCameraUbo(stack); // Create the new camera buffer
+            createDummyBuffer(stack); // Create a dummy buffer to use instead of VK_NULL_HANDLE
 
-            // Descriptor pool ve yeniden kullanılabilir tek descriptor set'i oluştur
+            // Create descriptor pool and our single reusable descriptor set
             createDescriptorPool(stack);
             allocateDescriptorSet(stack);
 
-            // ** HATA DÜZELTMESİ **: Compute image'ı başlangıçta *bir kez* GENERAL layout'una geçir.
-            // Bu, 39 FPS ve bozuk görüntüye neden olan
-            // VK_IMAGE_LAYOUT_UNDEFINED doğrulama hatasını düzeltir.
+            // Transition the compute image to GENERAL *once* at startup.
             transitionImageLayout(computeImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
-            // Descriptor set'i statik kaynaklarla güncelle (görüntü, kamera UBO)
-            // Sahne tamponları (üçgenler, bvh) sahne yüklendiğinde güncellenecek.
-            updateDescriptorSet(stack, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, cameraUbo);
+            // Descriptor set will be updated for the first time in internalSwapScene()
         }
-        System.out.println("LOG (VRT): VulkanEngine başarıyla başlatıldı.");
+        System.out.println("LOG (VRT): VulkanEngine initialized successfully.");
     }
 
     /**
-     * Ana render döngüsü. VRT üzerinde çalışır.
+     * Main render loop. Runs on the VRT.
      */
     private void mainLoop() {
         while (isRunning) {
-            // UI thread'inden gelen tüm bekleyen komutları işle
+            // Process all pending commands coming from the UI thread
             handleCommands();
 
-            // Henüz sahne yüklenmediyse bekle.
+            // If no scene is loaded yet, wait.
             if (currentScene == null) {
-                sleep(16); // ~60 FPS uyku
+                sleep(16); // ~60 FPS sleep
                 continue;
             }
 
-            // Bir kare render et
+            // Render one frame
             FrameData frame = renderFrame();
 
-            // Tamamlanan kareyi UI thread'ine yayınla
+            // Publish the completed frame to the UI thread
             frameQueue.set(frame);
         }
     }
 
     /**
-     * UI kuyruklarından (sahne/kamera) gelen tüm bekleyen komutları işler.
+     * Processes all pending commands from the queues (scene/camera).
      */
     private void handleCommands() {
-        // 1. Yeni sahne var mı diye kontrol et
+        // 1. Check for a new scene
         BuiltCpuData newSceneData = sceneQueue.poll();
         if (newSceneData != null) {
             internalSwapScene(newSceneData);
         }
 
-        // 2. Kamera güncellemesi var mı diye kontrol et
+        // 2. Check for a camera update
         Camera newCamera = cameraQueue.poll();
         if (newCamera != null) {
             internalUpdateCameraUBO(newCamera);
@@ -262,27 +266,27 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * Varsa eski sahneyi güvenle yok eder ve yenisini yükler.
+     * Destroys the old scene (if any) and loads the new one safely.
      */
     private void internalSwapScene(BuiltCpuData cpuData) {
-        System.out.println("LOG (VRT): Sahne değiştiriliyor...");
+        System.out.println("LOG (VRT): Swapping scene...");
 
-        // Kaynakları değiştirmeden önce GPU'nun boşta olduğundan emin ol
+        // Ensure the GPU is idle before swapping resources
         vkDeviceWaitIdle(device);
 
-        // 1. Eski sahneyi yok et (eğer varsa)
+        // 1. Destroy the previous scene (if any)
         if (currentScene != null) {
             destroyGpuSceneData(currentScene);
             currentScene = null;
         }
 
-        // 2. Yeni sahneyi yükle
+        // 2. Load the new scene
         try (MemoryStack stack = stackPush()) {
             long triBuffer = VK_NULL_HANDLE, triMem = VK_NULL_HANDLE;
             long matBuffer = VK_NULL_HANDLE, matMem = VK_NULL_HANDLE;
             long bvhBuffer = VK_NULL_HANDLE, bvhMem = VK_NULL_HANDLE;
 
-            // 2a. Üçgenleri Yükle
+            // 2a. Upload triangles
             long triBufferSize = cpuData.modelVertexData.remaining() * 4L;
             if (triBufferSize > 0) {
                 LongBuffer pBuf = stack.mallocLong(1); LongBuffer pMem = stack.mallocLong(1);
@@ -291,7 +295,7 @@ public class VulkanEngine implements Runnable {
             }
             memFree(cpuData.modelVertexData);
 
-            // 2b. Materyalleri Yükle
+            // 2b. Upload materials
             long matBufferSize = cpuData.modelMaterialData.remaining() * 4L;
             if (matBufferSize > 0) {
                 LongBuffer pBuf = stack.mallocLong(1); LongBuffer pMem = stack.mallocLong(1);
@@ -300,7 +304,7 @@ public class VulkanEngine implements Runnable {
             }
             memFree(cpuData.modelMaterialData);
 
-            // 2c. BVH Yükle
+            // 2c. Upload BVH
             long bvhBufferSize = cpuData.flatBvhData.remaining();
             if (bvhBufferSize > 0) {
                 LongBuffer pBuf = stack.mallocLong(1); LongBuffer pMem = stack.mallocLong(1);
@@ -308,41 +312,50 @@ public class VulkanEngine implements Runnable {
                 bvhBuffer = pBuf.get(0); bvhMem = pMem.get(0);
             }
 
-            // 3. Descriptor set'i yeni tamponları gösterecek şekilde güncelle
-            updateDescriptorSet(stack, triBuffer, matBuffer, bvhBuffer, cameraUbo);
+            // 3. Update the descriptor set to point to the new buffers
+            // Use dummyBuffer if any scene buffer is VK_NULL_HANDLE
+            long validTriBuffer = (triBuffer == VK_NULL_HANDLE) ? dummyBuffer : triBuffer;
+            long validMatBuffer = (matBuffer == VK_NULL_HANDLE) ? dummyBuffer : matBuffer;
+            long validBvhBuffer = (bvhBuffer == VK_NULL_HANDLE) ? dummyBuffer : bvhBuffer;
 
-            // 4. Yeni sahne verisini sakla
+            // This call now provides valid handles for all bindings
+            updateDescriptorSet(stack, validTriBuffer, validMatBuffer, validBvhBuffer, cameraUbo);
+
+            // 4. Store the new scene data
             currentScene = new GpuSceneData(triBuffer, triMem, matBuffer, matMem, bvhBuffer, bvhMem, cpuData.triangleCount);
 
-            System.out.println("LOG (VRT): Yeni sahne yüklendi. Üçgen sayısı: " + currentScene.triangleCount);
+            System.out.println("LOG (VRT): New scene loaded. Triangle count: " + currentScene.triangleCount);
         }
     }
 
     /**
-     * YENİ: Kalıcı olarak haritalanmış kamera UBO'sunu yeni verilerle günceller.
+     * NEW: Updates the persistently mapped camera UBO with new data.
      */
     private void internalUpdateCameraUBO(Camera camera) {
         if (cameraUboMapped == null) return;
 
-        // Shader'daki std140 layout'u ile eşleşen yapı:
-        // vec3 12 byte alır, 4 byte padding ile 16 byte'a tamamlanır.
-        camera.getOrigin().store(0, cameraUboMapped);      // offset 0 (0-11 kullanılır)
-        camera.getLowerLeft().store(16, cameraUboMapped);  // offset 16 (16-27 kullanılır)
-        camera.getHorizontal().store(32, cameraUboMapped); // offset 32 (32-43 kullanılır)
-        camera.getVertical().store(48, cameraUboMapped);   // offset 48 (48-59 kullanılır)
+        // Structure matching std140 layout in the shader:
+        // vec3 consumes 12 bytes, plus 4 bytes padding to align to 16.
 
-        // Bu veri artık bir sonraki renderFrame() için GPU tarafından görülebilir.
+        // --- DÜZELTME: Metod adlarını Camera.java ile eşleştir ---
+        camera.getOrigin().store(0, cameraUboMapped);                // offset 0
+        camera.getLowerLeft().store(16, cameraUboMapped); // offset 16 (getLowerLeft -> getLowerLeftCorner)
+        camera.getHorizontal().store(32, cameraUboMapped);           // offset 32
+        camera.getVertical().store(48, cameraUboMapped);             // offset 48
+        // --- Düzeltme sonu ---
+
+        // This data is now visible to the GPU for the next renderFrame().
     }
 
     /**
-     * Tek bir kare render eder ve piksel verisini bir FrameData nesnesinde döndürür.
+     * Renders a single frame and returns pixel data in a FrameData object.
      */
     private FrameData renderFrame() {
         try (MemoryStack stack = stackPush()) {
-            // 1. Komutları kaydet
+            // 1. Record commands
             recordComputeCommands(stack, currentScene);
 
-            // 2. GPU'ya gönder ve bekle
+            // 2. Submit to GPU and wait
             VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
                     .pCommandBuffers(stack.pointers(commandBuffer));
@@ -351,13 +364,13 @@ public class VulkanEngine implements Runnable {
             vkQueueSubmit(computeQueue, submitInfo, fence);
             vkWaitForFences(device, fence, true, Long.MAX_VALUE); // ~16ms
 
-            // 3. Görüntüyü staging buffer'dan oku
+            // 3. Read image via staging buffer
             long bufferSize = WIDTH * HEIGHT * 4;
             PointerBuffer pData = stack.mallocPointer(1);
             vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, pData);
             ByteBuffer pixelData = pData.getByteBuffer(0, (int) bufferSize);
 
-            // 4. Unmap yapmadan *önce* veriyi yeni bir direct buffer'a kopyala
+            // 4. Copy into a new direct buffer *before* unmapping
             ByteBuffer copyPixelData = ByteBuffer.allocateDirect((int)bufferSize);
             copyPixelData.put(pixelData);
             copyPixelData.flip();
@@ -369,7 +382,7 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * Tek bir kare için tüm Vulkan komutlarını kaydeder.
+     * Records all Vulkan commands for a single frame.
      */
     private void recordComputeCommands(MemoryStack stack, GpuSceneData scene) {
         vkResetCommandBuffer(commandBuffer, 0);
@@ -380,11 +393,11 @@ public class VulkanEngine implements Runnable {
 
         vkBeginCommandBuffer(commandBuffer, beginInfo);
 
-        // **HATA DÜZELTMESİ**: Bu bariyer artık layout'un GENERAL olduğunu varsayıyor.
+        // Barrier: Assumes layout is already GENERAL
         VkImageMemoryBarrier.Buffer imageBarrier1 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .srcAccessMask(0).dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
-                .oldLayout(VK_IMAGE_LAYOUT_GENERAL) // UNDEFINED idi, hataya neden oluyordu
+                .oldLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .newLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
@@ -393,21 +406,21 @@ public class VulkanEngine implements Runnable {
         vkCmdPipelineBarrier(commandBuffer,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, null, null, imageBarrier1); // Buffer barrier'ları vkDeviceWaitIdle hallettiği için kaldırıldı
+                0, null, null, imageBarrier1);
 
-        // 2. Pipeline ve descriptor'ları bağla
+        // 2. Bind pipeline and descriptors
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
 
-        // 3. Push Constant (üçgen sayısı) gönder
+        // 3. Push Constant (triangle count)
         ByteBuffer pushConstantData = stack.malloc(4);
         pushConstantData.putInt(0, scene.triangleCount);
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantData);
 
-        // 4. Shader'ı çalıştır
+        // 4. Dispatch shader
         vkCmdDispatch(commandBuffer, (WIDTH + 7) / 8, (HEIGHT + 7) / 8, 1);
 
-        // 5. Bariyer: Görüntüyü kopyalama için GENERAL -> TRANSFER_SRC_OPTIMAL yap
+        // 5. Barrier: prepare for copy GENERAL -> TRANSFER_SRC_OPTIMAL
         VkImageMemoryBarrier.Buffer imageBarrier2 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT)
@@ -421,7 +434,7 @@ public class VulkanEngine implements Runnable {
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0, null, null, imageBarrier2);
 
-        // 6. Görüntüyü VkImage'dan (VRAM) Staging Buffer'a (CPU-görünür) kopyala
+        // 6. Copy image from VkImage (VRAM) to staging buffer (CPU-visible)
         VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
                 .bufferOffset(0)
                 .bufferRowLength(0).bufferImageHeight(0)
@@ -431,12 +444,12 @@ public class VulkanEngine implements Runnable {
 
         vkCmdCopyImageToBuffer(commandBuffer, computeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, region);
 
-        // 7. **HATA DÜZELTMESİ**: Görüntüyü *bir sonraki* kare için tekrar GENERAL'e döndür.
+        // 7. Transition back to GENERAL for the *next* frame.
         VkImageMemoryBarrier.Buffer imageBarrier3 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(0)
                 .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-                .newLayout(VK_IMAGE_LAYOUT_GENERAL) // UNDEFINED idi, bu yasadışı
+                .newLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         imageBarrier3.srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
@@ -450,29 +463,29 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * Tüm Vulkan kaynaklarını temizler.
+     * Cleans up all Vulkan resources.
      */
     private void cleanup() {
-        System.out.println("LOG (VRT): VulkanEngine kaynakları temizleniyor...");
+        System.out.println("LOG (VRT): Cleaning up VulkanEngine resources...");
         if (device != null) {
             try {
                 vkDeviceWaitIdle(device);
             } catch (Exception e) {
-                System.err.println("WARN (VRT): vkDeviceWaitIdle sırasında istisna: " + e.getMessage());
+                System.err.println("WARN (VRT): Exception during vkDeviceWaitIdle: " + e.getMessage());
             }
         }
 
-        // UBO haritasını kaldır
+        // Unmap UBO
         if (cameraUboMapped != null) {
             vkUnmapMemory(device, cameraUboMemory);
         }
 
-        // Mevcut sahneyi yok et
+        // Destroy current scene
         if (currentScene != null) {
             destroyGpuSceneData(currentScene);
         }
 
-        // Pipeline kaynaklarını yok et
+        // Destroy pipeline resources
         if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, null);
         if (commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, commandPool, null);
         if (computePipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, computePipeline, null);
@@ -481,7 +494,11 @@ public class VulkanEngine implements Runnable {
         if (descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool, null);
         if (descriptorSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorSetLayout, null);
 
-        // Görüntü/tampon kaynaklarını yok et
+        // Clean up the dummy buffer
+        if (dummyBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, dummyBuffer, null);
+        if (dummyBufferMemory != VK_NULL_HANDLE) vkFreeMemory(device, dummyBufferMemory, null);
+
+        // Destroy image/buffer resources
         if (computeImageView != VK_NULL_HANDLE) vkDestroyImageView(device, computeImageView, null);
         if (computeImage != VK_NULL_HANDLE) vkDestroyImage(device, computeImage, null);
         if (computeImageMemory != VK_NULL_HANDLE) vkFreeMemory(device, computeImageMemory, null);
@@ -490,7 +507,7 @@ public class VulkanEngine implements Runnable {
         if (cameraUbo != VK_NULL_HANDLE) vkDestroyBuffer(device, cameraUbo, null);
         if (cameraUboMemory != VK_NULL_HANDLE) vkFreeMemory(device, cameraUboMemory, null);
 
-        // Çekirdek bileşenleri yok et
+        // Destroy core components
         if (device != null) vkDestroyDevice(device, null);
         if (debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
         if (instance != null) vkDestroyInstance(instance, null);
@@ -499,19 +516,18 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * GpuSceneData tamponlarını yok etmek için yardımcı metot.
+     * Helper to destroy GpuSceneData buffers.
      */
     private void destroyGpuSceneData(GpuSceneData scene) {
-        vkDestroyBuffer(device, scene.triangleBuffer, null);
-        vkFreeMemory(device, scene.triangleBufferMemory, null);
-        vkDestroyBuffer(device, scene.materialBuffer, null);
-        vkFreeMemory(device, scene.materialBufferMemory, null);
-        vkDestroyBuffer(device, scene.bvhBuffer, null);
-        vkFreeMemory(device, scene.bvhBufferMemory, null);
+        if (scene.triangleBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, scene.triangleBuffer, null);
+        if (scene.triangleBufferMemory != VK_NULL_HANDLE) vkFreeMemory(device, scene.triangleBufferMemory, null);
+        if (scene.materialBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, scene.materialBuffer, null);
+        if (scene.materialBufferMemory != VK_NULL_HANDLE) vkFreeMemory(device, scene.materialBufferMemory, null);
+        if (scene.bvhBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, scene.bvhBuffer, null);
+        if (scene.bvhBufferMemory != VK_NULL_HANDLE) vkFreeMemory(device, scene.bvhBufferMemory, null);
     }
 
-    // --- VULKAN YARDIMCI METOTLARI ---
-    // (Eski VulkanRenderer'dan kopyalandı)
+    // --- VULKAN HELPERS ---
 
     private void createInstance() {
         try (MemoryStack stack = stackPush()) {
@@ -524,7 +540,7 @@ public class VulkanEngine implements Runnable {
                     .pApplicationInfo(appInfo);
             PointerBuffer glfwExtensions = glfwGetRequiredInstanceExtensions();
             if (glfwExtensions == null) {
-                throw new RuntimeException("Gerekli GLFW eklentileri bulunamadı!");
+                throw new RuntimeException("Required GLFW extensions not found!");
             }
             PointerBuffer requiredExtensions;
             if (ENABLE_VALIDATION_LAYERS) {
@@ -544,7 +560,7 @@ public class VulkanEngine implements Runnable {
             }
             PointerBuffer pInstance = stack.mallocPointer(1);
             if (vkCreateInstance(createInfo, null, pInstance) != VK_SUCCESS) {
-                throw new RuntimeException("Vulkan Instance oluşturulamadı!");
+                throw new RuntimeException("Failed to create Vulkan Instance!");
             }
             instance = new VkInstance(pInstance.get(0), createInfo);
         }
@@ -557,7 +573,7 @@ public class VulkanEngine implements Runnable {
             populateDebugMessengerCreateInfo(createInfo);
             LongBuffer pDebugMessenger = stack.mallocLong(1);
             if (vkCreateDebugUtilsMessengerEXT(instance, createInfo, null, pDebugMessenger) != VK_SUCCESS) {
-                throw new RuntimeException("Debug messenger kurulamadı!");
+                throw new RuntimeException("Failed to set up debug messenger!");
             }
             debugMessenger = pDebugMessenger.get(0);
         }
@@ -579,7 +595,7 @@ public class VulkanEngine implements Runnable {
             IntBuffer deviceCount = stack.ints(0);
             vkEnumeratePhysicalDevices(instance, deviceCount, null);
             if (deviceCount.get(0) == 0) {
-                throw new RuntimeException("Vulkan destekli GPU bulunamadı!");
+                throw new RuntimeException("No Vulkan-capable GPU found!");
             }
             PointerBuffer pPhysicalDevices = stack.mallocPointer(deviceCount.get(0));
             vkEnumeratePhysicalDevices(instance, deviceCount, pPhysicalDevices);
@@ -591,7 +607,7 @@ public class VulkanEngine implements Runnable {
                 }
             }
             if (physicalDevice == null) {
-                throw new RuntimeException("Uygun bir GPU bulunamadı!");
+                throw new RuntimeException("No suitable GPU found!");
             }
         }
     }
@@ -624,16 +640,18 @@ public class VulkanEngine implements Runnable {
                     .queueFamilyIndex(computeQueueFamilyIndex)
                     .pQueuePriorities(pQueuePriorities);
             VkPhysicalDeviceFeatures deviceFeatures = VkPhysicalDeviceFeatures.calloc(stack);
+
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
                     .pQueueCreateInfos(queueCreateInfo)
                     .pEnabledFeatures(deviceFeatures);
+
             if (ENABLE_VALIDATION_LAYERS) {
                 createInfo.ppEnabledLayerNames(VALIDATION_LAYERS);
             }
             PointerBuffer pDevice = stack.mallocPointer(1);
             if (vkCreateDevice(physicalDevice, createInfo, null, pDevice) != VK_SUCCESS) {
-                throw new RuntimeException("Mantıksal cihaz oluşturulamadı!");
+                throw new RuntimeException("Failed to create logical device!");
             }
             device = new VkDevice(pDevice.get(0), physicalDevice, createInfo);
             PointerBuffer pQueue = stack.mallocPointer(1);
@@ -653,7 +671,7 @@ public class VulkanEngine implements Runnable {
                 .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
         LongBuffer pImage = stack.mallocLong(1);
         if (vkCreateImage(device, imageInfo, null, pImage) != VK_SUCCESS) {
-            throw new RuntimeException("Compute image oluşturulamadı!");
+            throw new RuntimeException("Failed to create compute image!");
         }
         computeImage = pImage.get(0);
         VkMemoryRequirements memRequirements = VkMemoryRequirements.malloc(stack);
@@ -664,7 +682,7 @@ public class VulkanEngine implements Runnable {
                 .memoryTypeIndex(findMemoryType(memRequirements.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
         LongBuffer pImageMemory = stack.mallocLong(1);
         if (vkAllocateMemory(device, allocInfo, null, pImageMemory) != VK_SUCCESS) {
-            throw new RuntimeException("Image belleği ayrılamadı!");
+            throw new RuntimeException("Failed to allocate image memory!");
         }
         computeImageMemory = pImageMemory.get(0);
         vkBindImageMemory(device, computeImage, computeImageMemory, 0);
@@ -674,7 +692,7 @@ public class VulkanEngine implements Runnable {
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         LongBuffer pImageView = stack.mallocLong(1);
         if (vkCreateImageView(device, viewInfo, null, pImageView) != VK_SUCCESS) {
-            throw new RuntimeException("Image view oluşturulamadı!");
+            throw new RuntimeException("Failed to create image view!");
         }
         computeImageView = pImageView.get(0);
     }
@@ -688,7 +706,7 @@ public class VulkanEngine implements Runnable {
                 .sharingMode(VK_SHARING_MODE_EXCLUSIVE);
         LongBuffer pBuffer = stack.mallocLong(1);
         if (vkCreateBuffer(device, bufferInfo, null, pBuffer) != VK_SUCCESS) {
-            throw new RuntimeException("Staging buffer oluşturulamadı!");
+            throw new RuntimeException("Failed to create staging buffer!");
         }
         stagingBuffer = pBuffer.get(0);
         VkMemoryRequirements memRequirements = VkMemoryRequirements.malloc(stack);
@@ -700,18 +718,18 @@ public class VulkanEngine implements Runnable {
                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
         LongBuffer pBufferMemory = stack.mallocLong(1);
         if (vkAllocateMemory(device, allocInfo, null, pBufferMemory) != VK_SUCCESS) {
-            throw new RuntimeException("Staging buffer belleği ayrılamadı!");
+            throw new RuntimeException("Failed to allocate staging buffer memory!");
         }
         stagingBufferMemory = pBufferMemory.get(0);
         vkBindBufferMemory(device, stagingBuffer, stagingBufferMemory, 0);
     }
 
     /**
-     * YENİ: Kamera UBO'sunu oluşturur.
-     * Hızlı, kilitlenmesiz güncellemeler için kalıcı olarak haritalanır.
+     * Creates the camera UBO.
+     * Persistently mapped for fast, lock-free updates.
      */
     private void createCameraUbo(MemoryStack stack) {
-        long bufferSize = 4 * 16; // 4 adet vec3, her biri vec4 (16 byte) olarak hizalanmış
+        long bufferSize = 4 * 16; // 4 vec3s, each aligned to vec4 (16 bytes)
 
         LongBuffer pBuffer = stack.mallocLong(1);
         LongBuffer pMemory = stack.mallocLong(1);
@@ -724,12 +742,30 @@ public class VulkanEngine implements Runnable {
         cameraUbo = pBuffer.get(0);
         cameraUboMemory = pMemory.get(0);
 
-        // Tamponu kalıcı olarak haritala
+        // Persistently map the buffer
         PointerBuffer pData = stack.mallocPointer(1);
         vkMapMemory(device, cameraUboMemory, 0, bufferSize, 0, pData);
         cameraUboMapped = pData.getByteBuffer(0, (int)bufferSize);
 
-        System.out.println("LOG (VRT): Kamera UBO'su oluşturuldu ve kalıcı olarak haritalandı.");
+        System.out.println("LOG (VRT): Camera UBO created and persistently mapped.");
+    }
+
+    /**
+     * Creates a tiny dummy buffer.
+     */
+    private void createDummyBuffer(MemoryStack stack) {
+        long bufferSize = 4; // 4 bytes is a minimal valid size
+
+        LongBuffer pBuffer = stack.mallocLong(1);
+        LongBuffer pMemory = stack.mallocLong(1);
+
+        createBuffer(stack, bufferSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                pBuffer, pMemory);
+
+        dummyBuffer = pBuffer.get(0);
+        dummyBufferMemory = pMemory.get(0);
     }
 
     private void createHostVisibleBuffer(MemoryStack stack, long bufferSize, int usage,
@@ -752,7 +788,7 @@ public class VulkanEngine implements Runnable {
                 .usage(usage)
                 .sharingMode(VK_SHARING_MODE_EXCLUSIVE);
         if (vkCreateBuffer(device, bufferInfo, null, pBuffer) != VK_SUCCESS) {
-            throw new RuntimeException("Buffer oluşturulamadı!");
+            throw new RuntimeException("Failed to create buffer!");
         }
         VkMemoryRequirements memRequirements = VkMemoryRequirements.malloc(stack);
         vkGetBufferMemoryRequirements(device, pBuffer.get(0), memRequirements);
@@ -761,14 +797,14 @@ public class VulkanEngine implements Runnable {
                 .allocationSize(memRequirements.size())
                 .memoryTypeIndex(findMemoryType(memRequirements.memoryTypeBits(), properties));
         if (vkAllocateMemory(device, allocInfo, null, pMemory) != VK_SUCCESS) {
-            throw new RuntimeException("Buffer belleği ayrılamadı!");
+            throw new RuntimeException("Failed to allocate buffer memory!");
         }
         vkBindBufferMemory(device, pBuffer.get(0), pMemory.get(0), 0);
     }
 
     /**
-     * YENİDEN DÜZENLENDİ: Sadece DescriptorSetLayout'u oluşturur.
-     * Artık Kamera UBO'su için binding 4'ü içerir.
+     * Creates the DescriptorSetLayout.
+     * Now includes binding 4 for the Camera UBO.
      */
     private void createDescriptorSetLayout(MemoryStack stack) {
         VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(5, stack);
@@ -781,7 +817,7 @@ public class VulkanEngine implements Runnable {
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
         bindings.get(3).binding(3).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
-        // YENİ Binding 4: Kamera UBO
+        // NEW Binding 4: Camera UBO
         bindings.get(4).binding(4).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
 
@@ -794,7 +830,7 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * YENİDEN DÜZENLENDİ: Sadece PipelineLayout'u oluşturur.
+     * Creates only the PipelineLayout.
      */
     private void createPipelineLayout(MemoryStack stack) {
         VkPushConstantRange.Buffer pushConstantRange = VkPushConstantRange.calloc(1, stack)
@@ -810,13 +846,13 @@ public class VulkanEngine implements Runnable {
     }
 
     /**
-     * YENİDEN DÜZENLENDİ: Sadece ComputePipeline'ı oluşturur.
+     * Creates only the ComputePipeline.
      */
     private void createComputePipeline(MemoryStack stack) {
         try {
             computeShaderModule = createShaderModule(loadShaderFromFile(SHADER_PATH));
         } catch (IOException e) {
-            throw new RuntimeException("Shader yüklenemedi: " + e.getMessage());
+            throw new RuntimeException("Failed to load shader: " + e.getMessage());
         }
         VkPipelineShaderStageCreateInfo shaderStageInfo = VkPipelineShaderStageCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
@@ -829,33 +865,33 @@ public class VulkanEngine implements Runnable {
                 .layout(pipelineLayout);
         LongBuffer pComputePipeline = stack.mallocLong(1);
         if (vkCreateComputePipelines(device, VK_NULL_HANDLE, pipelineInfo, null, pComputePipeline) != VK_SUCCESS) {
-            throw new RuntimeException("Compute pipeline oluşturulamadı!");
+            throw new RuntimeException("Failed to create compute pipeline!");
         }
         computePipeline = pComputePipeline.get(0);
     }
 
     /**
-     * YENİDEN DÜZENLENDİ: Sadece DescriptorPool'u oluşturur.
+     * Creates only the DescriptorPool.
      */
     private void createDescriptorPool(MemoryStack stack) {
         VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(3, stack);
         poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
         poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(3); // Tri, Mat, BVH
-        poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1); // Kamera
+        poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1); // Camera
 
         VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
                 .pPoolSizes(poolSizes)
-                .maxSets(1); // Sadece bir descriptor set'e ihtiyacımız var
+                .maxSets(1); // We only need one descriptor set
         LongBuffer pDescriptorPool = stack.mallocLong(1);
         if (vkCreateDescriptorPool(device, poolInfo, null, pDescriptorPool) != VK_SUCCESS) {
-            throw new RuntimeException("Descriptor pool oluşturulamadı!");
+            throw new RuntimeException("Failed to create descriptor pool!");
         }
         descriptorPool = pDescriptorPool.get(0);
     }
 
     /**
-     * YENİDEN DÜZENLENDİ: Tek descriptor set'imizi ayırır (allocate).
+     * Allocates our single descriptor set.
      */
     private void allocateDescriptorSet(MemoryStack stack) {
         VkDescriptorSetAllocateInfo allocSetInfo = VkDescriptorSetAllocateInfo.calloc(stack)
@@ -864,14 +900,14 @@ public class VulkanEngine implements Runnable {
                 .pSetLayouts(stack.longs(descriptorSetLayout));
         LongBuffer pDescriptorSet = stack.mallocLong(1);
         if (vkAllocateDescriptorSets(device, allocSetInfo, pDescriptorSet) != VK_SUCCESS) {
-            throw new RuntimeException("Descriptor set ayrılamadı!");
+            throw new RuntimeException("Failed to allocate descriptor set!");
         }
         descriptorSet = pDescriptorSet.get(0);
     }
 
     /**
-     * Yeniden kullanılabilir tek descriptor set'imizi günceller.
-     * Bu artık init() ve internalSwapScene() tarafından çağrılır.
+     * Updates our single reusable descriptor set.
+     * Called by init() and internalSwapScene().
      */
     private void updateDescriptorSet(MemoryStack stack, long triangleBuffer, long materialBuffer, long bvhBuffer, long cameraBuffer) {
 
@@ -879,7 +915,7 @@ public class VulkanEngine implements Runnable {
                 .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .imageView(computeImageView);
 
-        // Sahne tamponları
+        // Scene buffers
         VkDescriptorBufferInfo.Buffer triangleBufferDescriptor = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(triangleBuffer).offset(0).range(VK_WHOLE_SIZE);
         VkDescriptorBufferInfo.Buffer materialBufferDescriptor = VkDescriptorBufferInfo.calloc(1, stack)
@@ -887,7 +923,7 @@ public class VulkanEngine implements Runnable {
         VkDescriptorBufferInfo.Buffer bvhBufferDescriptor = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(bvhBuffer).offset(0).range(VK_WHOLE_SIZE);
 
-        // Kamera tamponu
+        // Camera buffer
         VkDescriptorBufferInfo.Buffer cameraBufferDescriptor = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(cameraBuffer).offset(0).range(VK_WHOLE_SIZE);
 
@@ -905,7 +941,7 @@ public class VulkanEngine implements Runnable {
         descriptorWrites.get(3).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
                 .dstBinding(3).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).pBufferInfo(bvhBufferDescriptor);
-        // YENİ Binding 4 (Kamera UBO)
+        // NEW Binding 4 (Camera UBO)
         descriptorWrites.get(4).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
                 .dstBinding(4).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
                 .descriptorCount(1).pBufferInfo(cameraBufferDescriptor);
@@ -920,7 +956,7 @@ public class VulkanEngine implements Runnable {
                 .queueFamilyIndex(computeQueueFamilyIndex);
         LongBuffer pCmdPool = stack.mallocLong(1);
         if (vkCreateCommandPool(device, cmdPoolInfo, null, pCmdPool) != VK_SUCCESS) {
-            throw new RuntimeException("Command pool oluşturulamadı!");
+            throw new RuntimeException("Failed to create command pool!");
         }
         commandPool = pCmdPool.get(0);
         VkCommandBufferAllocateInfo cmdAllocInfo = VkCommandBufferAllocateInfo.calloc(stack)
@@ -935,14 +971,13 @@ public class VulkanEngine implements Runnable {
         LongBuffer pFence = stack.mallocLong(1);
         VkFenceCreateInfo fenceInfo = VkFenceCreateInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
         if (vkCreateFence(device, fenceInfo, null, pFence) != VK_SUCCESS) {
-            throw new RuntimeException("Fence oluşturulamadı");
+            throw new RuntimeException("Failed to create fence!");
         }
         fence = pFence.get(0);
     }
 
     /**
-     * YENİ: Görüntü düzeni geçişleri için tek seferlik komut gönderen yardımcı metot.
-     * Bu, UNDEFINED layout hatasını düzeltir.
+     * One-time command helper for image layout transitions.
      */
     private void transitionImageLayout(long image, int oldLayout, int newLayout) {
         try (MemoryStack stack = stackPush()) {
@@ -978,7 +1013,7 @@ public class VulkanEngine implements Runnable {
                 sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
                 destStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             } else {
-                throw new IllegalArgumentException("Desteklenmeyen layout geçişi!");
+                throw new IllegalArgumentException("Unsupported layout transition!");
             }
 
             vkCmdPipelineBarrier(cmdBuffer, sourceStage, destStage, 0, null, null, barrier);
@@ -988,10 +1023,10 @@ public class VulkanEngine implements Runnable {
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
                     .pCommandBuffers(pCmdBuffer);
             vkQueueSubmit(computeQueue, submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(computeQueue); // Komutun bitmesini bekle
+            vkQueueWaitIdle(computeQueue); // Wait for completion
             vkFreeCommandBuffers(device, commandPool, pCmdBuffer);
 
-            System.out.println("LOG (VRT): Başlangıç görüntü layout'u UNDEFINED -> GENERAL olarak değiştirildi.");
+            System.out.println("LOG (VRT): Initial image layout transitioned UNDEFINED -> GENERAL.");
         }
     }
 
@@ -1005,7 +1040,7 @@ public class VulkanEngine implements Runnable {
                 }
             }
         }
-        throw new RuntimeException("Uygun bellek türü bulunamadı!");
+        throw new RuntimeException("Failed to find suitable memory type!");
     }
 
     private ByteBuffer loadShaderFromFile(String filepath) throws IOException {
@@ -1024,7 +1059,7 @@ public class VulkanEngine implements Runnable {
                     .pCode(spirvCode);
             LongBuffer pShaderModule = stack.mallocLong(1);
             if (vkCreateShaderModule(device, createInfo, null, pShaderModule) != VK_SUCCESS) {
-                throw new RuntimeException("Shader module oluşturulamadı!");
+                throw new RuntimeException("Failed to create shader module!");
             }
             return pShaderModule.get(0);
         }

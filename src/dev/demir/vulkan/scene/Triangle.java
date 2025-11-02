@@ -17,8 +17,7 @@ public class Triangle implements Hittable {
     public final int materialIndex;
     public final int vertexIndex;
 
-    // YENİ EKLENEN ALANLAR (Hata 2'yi çözmek için)
-    public final float r, g, b; // Albedo (renk)
+    public final float r, g, b;
     public final float materialType; // 0.0f = Lambertian
 
     /**
@@ -34,17 +33,18 @@ public class Triangle implements Hittable {
      * @param matType Material type (0.0f for Lambertian)
      */
     public Triangle(Vec3 v0, Vec3 v1, Vec3 v2, int matIndex, int vertIndex,
-                    float r, float g, float b, float matType) { // YENİ KURUCU
+                    float r, float g, float b, float matType) {
         this.v0 = v0;
         this.v1 = v1;
         this.v2 = v2;
         this.materialIndex = matIndex;
         this.vertexIndex = vertIndex;
 
-        // YENİ: Renkleri sakla
         this.r = r;
         this.g = g;
         this.b = b;
+
+
         this.materialType = matType;
 
         this.bbox = calculateBoundingBox();
