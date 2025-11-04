@@ -33,14 +33,12 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Core Vulkan Engine.
- * This class implements Runnable and runs on its own dedicated thread (VRT).
- * It manages its own Vulkan resources and lifecycle.
- * Receives commands from the UI thread (Swing/EDT) via thread-safe queues.
- * This architecture fixes synchronization issues, layout errors,
- * and cleanly separates rendering logic from the UI.
  *
- * PHASE 2.5: This engine is now fully updated to support the Camera UBO
- * at binding = 4.
+ * PHASE 5: Updated for Frame Accumulation and Sky Toggle.
+ * - Added skyToggleQueue to receive commands from VulkanApp.
+ * - UBO is now 80 bytes to hold frameCount and isSkyEnabled.
+ * - mainLoop now updates UBO every frame to increment frameCount.
+ * - DescriptorSetLayout now includes binding 5 for accumulation image.
  */
 public class VulkanEngine implements Runnable {
 
@@ -48,8 +46,9 @@ public class VulkanEngine implements Runnable {
     private static final int WIDTH = 1280;
     private static final int HEIGHT = 720;
 
-    // --- DÜZELTME: Shader adını konuştuğumuz adla güncelle ---
-    private static final String SHADER_PATH = "shaders_spv/compute_dynamic_ray.spv";
+    // Use the shader name you defined
+    private static final String SHADER_PATH = "shaders_spv/compute_with_dynamic_light_source.spv";
+
 
     private static final boolean ENABLE_VALIDATION_LAYERS = true;
 
@@ -61,6 +60,8 @@ public class VulkanEngine implements Runnable {
     private final AtomicReference<FrameData> frameQueue; // VRT -> UI: Publishes the completed frame
     private final ConcurrentLinkedQueue<BuiltCpuData> sceneQueue;  // UI -> VRT: Sends a new scene to load
     private final ConcurrentLinkedQueue<Camera> cameraQueue; // UI -> VRT: Sends camera updates
+    // --- NEW (Phase 5): Sky toggle queue ---
+    private final ConcurrentLinkedQueue<Boolean> skyToggleQueue;
 
     // --- Core Vulkan Objects ---
     private VkInstance instance;
@@ -100,6 +101,9 @@ public class VulkanEngine implements Runnable {
     // --- Current State ---
     private GpuSceneData currentScene = null;
 
+    private Camera currentCamera = null;
+    private int isSkyEnabled = 0; // 1 = true (default ON), 0 = false
+
     // Static Validation Layer Setup
     private static final PointerBuffer VALIDATION_LAYERS;
     static {
@@ -119,6 +123,7 @@ public class VulkanEngine implements Runnable {
         this.frameQueue = frameQueue;
         this.sceneQueue = new ConcurrentLinkedQueue<>();
         this.cameraQueue = new ConcurrentLinkedQueue<>();
+        this.skyToggleQueue = new ConcurrentLinkedQueue<>(); // <-- NEW
         this.thread = new Thread(this, "Vulkan-Engine-Thread");
         this.thread.setDaemon(true);
     }
@@ -148,21 +153,38 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Thread-safe method for the UI thread to submit a new scene to load.
-     * The engine will load it on the next suitable frame.
      * @param sceneData CPU-side data produced by SceneBuilder.
      */
     public void submitScene(BuiltCpuData sceneData) {
+        // When we swap the scene, we MUST reset accumulation
+        if (this.currentCamera != null) {
+            this.currentCamera.resetAccumulation();
+        }
         sceneQueue.add(sceneData);
     }
 
     /**
      * Thread-safe method for the UI thread to submit a camera update.
-     * The engine will write this update into the UBO on the next suitable frame.
      * @param camera New camera state.
      */
     public void submitCameraUpdate(Camera camera) {
+        // Camera has already been reset in VulkanApp,
+        // just send it to the queue.
         cameraQueue.add(camera);
     }
+
+    /**
+     * --- NEW (Phase 5): Thread-safe method for UI to toggle sky.
+     * @param isSkyOn true if sky light is enabled, false for black.
+     */
+    public void submitSkyToggle(boolean isSkyOn) {
+        System.out.println("LOG (VRT-Queue): Sky Toggle command received: " + isSkyOn);
+        if (this.currentCamera != null) {
+            this.currentCamera.resetAccumulation(); // Reset noise count
+        }
+        skyToggleQueue.add(isSkyOn);
+    }
+
 
     // --- VULKAN RENDER THREAD (VRT) LOGIC ---
 
@@ -199,94 +221,98 @@ public class VulkanEngine implements Runnable {
         createLogicalDevice();
 
         try (MemoryStack stack = stackPush()) {
-            // Create core resources
             createCommandPoolAndBuffer(stack);
             createFence(stack);
-
-            // Create resources tied to the layout
-            createDescriptorSetLayout(stack); // Now includes binding 4 for the Camera UBO
+            createDescriptorSetLayout(stack); // Now has 6 bindings
             createPipelineLayout(stack);
             createComputePipeline(stack);
-
-            // Create resources used for rendering
-            createComputeImage(stack);
+            createComputeImage(stack); // Now has STORAGE_BIT usage
             createStagingBuffer(stack);
-            createCameraUbo(stack); // Create the new camera buffer
-            createDummyBuffer(stack); // Create a dummy buffer to use instead of VK_NULL_HANDLE
-
-            // Create descriptor pool and our single reusable descriptor set
-            createDescriptorPool(stack);
+            createCameraUbo(stack); // UBO size is now 80 bytes
+            createDummyBuffer(stack);
+            createDescriptorPool(stack); // Now allocates 2 storage images
             allocateDescriptorSet(stack);
-
-            // Transition the compute image to GENERAL *once* at startup.
             transitionImageLayout(computeImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-
-            // Descriptor set will be updated for the first time in internalSwapScene()
         }
         System.out.println("LOG (VRT): VulkanEngine initialized successfully.");
     }
 
     /**
      * Main render loop. Runs on the VRT.
+     * UPDATED for Phase 5.
      */
     private void mainLoop() {
         while (isRunning) {
-            // Process all pending commands coming from the UI thread
+            // 1. Process all pending commands
             handleCommands();
 
-            // If no scene is loaded yet, wait.
-            if (currentScene == null) {
+            // 2. Wait if scene or camera are not ready
+            if (currentScene == null || currentCamera == null) {
                 sleep(16); // ~60 FPS sleep
                 continue;
             }
 
-            // Render one frame
+            // 3. (NEW) Update the UBO every single frame.
+            // This sends the incrementing frameCount to the shader.
+            internalUpdateCameraUBO();
+
+            // 4. Render one frame
             FrameData frame = renderFrame();
 
-            // Publish the completed frame to the UI thread
+            // 5. Publish the completed frame to the UI thread
             frameQueue.set(frame);
+
+            // 6. (NEW) Increment the frame counter *after* rendering
+            currentCamera.incrementFrameCount();
         }
     }
 
     /**
-     * Processes all pending commands from the queues (scene/camera).
+     * Processes all pending commands from the queues (scene/camera/sky).
+     * UPDATED for Phase 5.
      */
     private void handleCommands() {
         // 1. Check for a new scene
         BuiltCpuData newSceneData = sceneQueue.poll();
         if (newSceneData != null) {
             internalSwapScene(newSceneData);
+            // (Accumulation was reset in submitScene)
         }
 
         // 2. Check for a camera update
         Camera newCamera = cameraQueue.poll();
         if (newCamera != null) {
-            internalUpdateCameraUBO(newCamera);
+            this.currentCamera = newCamera;
+            // (Accumulation was reset in VulkanApp)
+        }
+
+        // 3. (NEW) Check for a sky toggle
+        Boolean skyState = skyToggleQueue.poll();
+        if (skyState != null) {
+            System.out.println("LOG (VRT-Handler): Sky state set to: " + skyState); // <-- SENİN İSTEDİĞİN LOG
+            this.isSkyEnabled = skyState ? 1 : 0;
+            // (Accumulation was reset in submitSkyToggle)
         }
     }
 
     /**
      * Destroys the old scene (if any) and loads the new one safely.
+     * (No changes from Phase 4)
      */
     private void internalSwapScene(BuiltCpuData cpuData) {
         System.out.println("LOG (VRT): Swapping scene...");
-
-        // Ensure the GPU is idle before swapping resources
         vkDeviceWaitIdle(device);
 
-        // 1. Destroy the previous scene (if any)
         if (currentScene != null) {
             destroyGpuSceneData(currentScene);
             currentScene = null;
         }
 
-        // 2. Load the new scene
         try (MemoryStack stack = stackPush()) {
             long triBuffer = VK_NULL_HANDLE, triMem = VK_NULL_HANDLE;
             long matBuffer = VK_NULL_HANDLE, matMem = VK_NULL_HANDLE;
             long bvhBuffer = VK_NULL_HANDLE, bvhMem = VK_NULL_HANDLE;
 
-            // 2a. Upload triangles
             long triBufferSize = cpuData.modelVertexData.remaining() * 4L;
             if (triBufferSize > 0) {
                 LongBuffer pBuf = stack.mallocLong(1); LongBuffer pMem = stack.mallocLong(1);
@@ -295,7 +321,6 @@ public class VulkanEngine implements Runnable {
             }
             memFree(cpuData.modelVertexData);
 
-            // 2b. Upload materials
             long matBufferSize = cpuData.modelMaterialData.remaining() * 4L;
             if (matBufferSize > 0) {
                 LongBuffer pBuf = stack.mallocLong(1); LongBuffer pMem = stack.mallocLong(1);
@@ -304,7 +329,6 @@ public class VulkanEngine implements Runnable {
             }
             memFree(cpuData.modelMaterialData);
 
-            // 2c. Upload BVH
             long bvhBufferSize = cpuData.flatBvhData.remaining();
             if (bvhBufferSize > 0) {
                 LongBuffer pBuf = stack.mallocLong(1); LongBuffer pMem = stack.mallocLong(1);
@@ -312,65 +336,58 @@ public class VulkanEngine implements Runnable {
                 bvhBuffer = pBuf.get(0); bvhMem = pMem.get(0);
             }
 
-            // 3. Update the descriptor set to point to the new buffers
-            // Use dummyBuffer if any scene buffer is VK_NULL_HANDLE
             long validTriBuffer = (triBuffer == VK_NULL_HANDLE) ? dummyBuffer : triBuffer;
             long validMatBuffer = (matBuffer == VK_NULL_HANDLE) ? dummyBuffer : matBuffer;
             long validBvhBuffer = (bvhBuffer == VK_NULL_HANDLE) ? dummyBuffer : bvhBuffer;
 
-            // This call now provides valid handles for all bindings
             updateDescriptorSet(stack, validTriBuffer, validMatBuffer, validBvhBuffer, cameraUbo);
 
-            // 4. Store the new scene data
             currentScene = new GpuSceneData(triBuffer, triMem, matBuffer, matMem, bvhBuffer, bvhMem, cpuData.triangleCount);
-
             System.out.println("LOG (VRT): New scene loaded. Triangle count: " + currentScene.triangleCount);
         }
     }
 
     /**
-     * NEW: Updates the persistently mapped camera UBO with new data.
+     * Updates the persistently mapped camera UBO with new data.
+     * UPDATED for Phase 5.
      */
-    private void internalUpdateCameraUBO(Camera camera) {
-        if (cameraUboMapped == null) return;
+    private void internalUpdateCameraUBO() {
+        if (cameraUboMapped == null || currentCamera == null) return;
 
         // Structure matching std140 layout in the shader:
-        // vec3 consumes 12 bytes, plus 4 bytes padding to align to 16.
+        // vec3s (16-byte aligned)
+        currentCamera.getOrigin().store(0, cameraUboMapped);                // offset 0
+        currentCamera.getLowerLeft().store(16, cameraUboMapped); // offset 16 (FIXED typo)
+        currentCamera.getHorizontal().store(32, cameraUboMapped);           // offset 32
+        currentCamera.getVertical().store(48, cameraUboMapped);             // offset 48
 
-        // --- DÜZELTME: Metod adlarını Camera.java ile eşleştir ---
-        camera.getOrigin().store(0, cameraUboMapped);                // offset 0
-        camera.getLowerLeft().store(16, cameraUboMapped); // offset 16 (getLowerLeft -> getLowerLeftCorner)
-        camera.getHorizontal().store(32, cameraUboMapped);           // offset 32
-        camera.getVertical().store(48, cameraUboMapped);             // offset 48
-        // --- Düzeltme sonu ---
-
-        // This data is now visible to the GPU for the next renderFrame().
+        // --- NEW (Phase 5): Write int values ---
+        // We write them at offset 64 (the next 16-byte alignment block)
+        cameraUboMapped.putInt(64, currentCamera.getFrameCount());
+        cameraUboMapped.putInt(68, this.isSkyEnabled); // 4 bytes after frameCount
     }
 
     /**
      * Renders a single frame and returns pixel data in a FrameData object.
+     * (No changes from Phase 4)
      */
     private FrameData renderFrame() {
         try (MemoryStack stack = stackPush()) {
-            // 1. Record commands
             recordComputeCommands(stack, currentScene);
 
-            // 2. Submit to GPU and wait
             VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
                     .pCommandBuffers(stack.pointers(commandBuffer));
 
             vkResetFences(device, fence);
             vkQueueSubmit(computeQueue, submitInfo, fence);
-            vkWaitForFences(device, fence, true, Long.MAX_VALUE); // ~16ms
+            vkWaitForFences(device, fence, true, Long.MAX_VALUE);
 
-            // 3. Read image via staging buffer
             long bufferSize = WIDTH * HEIGHT * 4;
             PointerBuffer pData = stack.mallocPointer(1);
             vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, pData);
             ByteBuffer pixelData = pData.getByteBuffer(0, (int) bufferSize);
 
-            // 4. Copy into a new direct buffer *before* unmapping
             ByteBuffer copyPixelData = ByteBuffer.allocateDirect((int)bufferSize);
             copyPixelData.put(pixelData);
             copyPixelData.flip();
@@ -383,44 +400,37 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Records all Vulkan commands for a single frame.
+     * UPDATED for Phase 5 (Image barriers).
      */
     private void recordComputeCommands(MemoryStack stack, GpuSceneData scene) {
         vkResetCommandBuffer(commandBuffer, 0);
-
         VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
                 .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-
         vkBeginCommandBuffer(commandBuffer, beginInfo);
 
         // Barrier: Assumes layout is already GENERAL
+        // --- UPDATED (Phase 5): Access mask must allow both read and write ---
         VkImageMemoryBarrier.Buffer imageBarrier1 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
-                .srcAccessMask(0).dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                // (Optimization: We know the first read is from shader, so prev read isn't needed)
+                .srcAccessMask(VK_ACCESS_SHADER_READ_BIT).dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT)
                 .oldLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .newLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         imageBarrier1.srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, null, null, imageBarrier1);
 
-        vkCmdPipelineBarrier(commandBuffer,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, null, null, imageBarrier1);
-
-        // 2. Bind pipeline and descriptors
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
 
-        // 3. Push Constant (triangle count)
         ByteBuffer pushConstantData = stack.malloc(4);
         pushConstantData.putInt(0, scene.triangleCount);
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantData);
 
-        // 4. Dispatch shader
         vkCmdDispatch(commandBuffer, (WIDTH + 7) / 8, (HEIGHT + 7) / 8, 1);
 
-        // 5. Barrier: prepare for copy GENERAL -> TRANSFER_SRC_OPTIMAL
         VkImageMemoryBarrier.Buffer imageBarrier2 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT)
@@ -428,42 +438,33 @@ public class VulkanEngine implements Runnable {
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         imageBarrier2.srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, null, null, imageBarrier2);
 
-        vkCmdPipelineBarrier(commandBuffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, null, null, imageBarrier2);
-
-        // 6. Copy image from VkImage (VRAM) to staging buffer (CPU-visible)
         VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
                 .bufferOffset(0)
                 .bufferRowLength(0).bufferImageHeight(0)
                 .imageSubresource(s -> s.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1))
                 .imageOffset(o -> o.x(0).y(0).z(0))
                 .imageExtent(e -> e.width(WIDTH).height(HEIGHT).depth(1));
-
         vkCmdCopyImageToBuffer(commandBuffer, computeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, region);
 
-        // 7. Transition back to GENERAL for the *next* frame.
+        // --- UPDATED (Phase 5): Transition back to GENERAL (for next frame's READ) ---
         VkImageMemoryBarrier.Buffer imageBarrier3 = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
-                .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(0)
+                .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(VK_ACCESS_SHADER_READ_BIT) // Read for next frame
                 .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
                 .newLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         imageBarrier3.srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
-
-        vkCmdPipelineBarrier(commandBuffer,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                0, null, null, imageBarrier3);
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, null, null, imageBarrier3);
 
         vkEndCommandBuffer(commandBuffer);
     }
 
     /**
      * Cleans up all Vulkan resources.
+     * (No changes from Phase 4)
      */
     private void cleanup() {
         System.out.println("LOG (VRT): Cleaning up VulkanEngine resources...");
@@ -474,18 +475,8 @@ public class VulkanEngine implements Runnable {
                 System.err.println("WARN (VRT): Exception during vkDeviceWaitIdle: " + e.getMessage());
             }
         }
-
-        // Unmap UBO
-        if (cameraUboMapped != null) {
-            vkUnmapMemory(device, cameraUboMemory);
-        }
-
-        // Destroy current scene
-        if (currentScene != null) {
-            destroyGpuSceneData(currentScene);
-        }
-
-        // Destroy pipeline resources
+        if (cameraUboMapped != null) vkUnmapMemory(device, cameraUboMemory);
+        if (currentScene != null) destroyGpuSceneData(currentScene);
         if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, null);
         if (commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, commandPool, null);
         if (computePipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, computePipeline, null);
@@ -493,12 +484,8 @@ public class VulkanEngine implements Runnable {
         if (computeShaderModule != VK_NULL_HANDLE) vkDestroyShaderModule(device, computeShaderModule, null);
         if (descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool, null);
         if (descriptorSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorSetLayout, null);
-
-        // Clean up the dummy buffer
         if (dummyBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, dummyBuffer, null);
         if (dummyBufferMemory != VK_NULL_HANDLE) vkFreeMemory(device, dummyBufferMemory, null);
-
-        // Destroy image/buffer resources
         if (computeImageView != VK_NULL_HANDLE) vkDestroyImageView(device, computeImageView, null);
         if (computeImage != VK_NULL_HANDLE) vkDestroyImage(device, computeImage, null);
         if (computeImageMemory != VK_NULL_HANDLE) vkFreeMemory(device, computeImageMemory, null);
@@ -506,12 +493,9 @@ public class VulkanEngine implements Runnable {
         if (stagingBufferMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingBufferMemory, null);
         if (cameraUbo != VK_NULL_HANDLE) vkDestroyBuffer(device, cameraUbo, null);
         if (cameraUboMemory != VK_NULL_HANDLE) vkFreeMemory(device, cameraUboMemory, null);
-
-        // Destroy core components
         if (device != null) vkDestroyDevice(device, null);
         if (debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
         if (instance != null) vkDestroyInstance(instance, null);
-
         glfwTerminate();
     }
 
@@ -660,6 +644,10 @@ public class VulkanEngine implements Runnable {
         }
     }
 
+    /**
+     * Creates the compute image.
+     * UPDATED for Phase 5.
+     */
     private void createComputeImage(MemoryStack stack) {
         VkImageCreateInfo imageInfo = VkImageCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
@@ -667,6 +655,8 @@ public class VulkanEngine implements Runnable {
                 .extent(e -> e.width(WIDTH).height(HEIGHT).depth(1))
                 .mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
                 .tiling(VK_IMAGE_TILING_OPTIMAL)
+                // --- NEW (Phase 5): Need to read from this image (binding 5)
+                // and write to it (binding 0). STORAGE_BIT covers both.
                 .usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
                 .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
         LongBuffer pImage = stack.mallocLong(1);
@@ -726,10 +716,12 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Creates the camera UBO.
-     * Persistently mapped for fast, lock-free updates.
+     * UPDATED for Phase 5.
      */
     private void createCameraUbo(MemoryStack stack) {
-        long bufferSize = 4 * 16; // 4 vec3s, each aligned to vec4 (16 bytes)
+        // 4 vec3s (16-byte aligned) + 2 ints (16-byte aligned block)
+        // (4 * 16) + 16 = 80 bytes
+        long bufferSize = 80;
 
         LongBuffer pBuffer = stack.mallocLong(1);
         LongBuffer pMemory = stack.mallocLong(1);
@@ -752,18 +744,16 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Creates a tiny dummy buffer.
+     * (No changes from Phase 4)
      */
     private void createDummyBuffer(MemoryStack stack) {
         long bufferSize = 4; // 4 bytes is a minimal valid size
-
         LongBuffer pBuffer = stack.mallocLong(1);
         LongBuffer pMemory = stack.mallocLong(1);
-
         createBuffer(stack, bufferSize,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 pBuffer, pMemory);
-
         dummyBuffer = pBuffer.get(0);
         dummyBufferMemory = pMemory.get(0);
     }
@@ -773,7 +763,6 @@ public class VulkanEngine implements Runnable {
         createBuffer(stack, bufferSize, usage,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                 pBuffer, pMemory);
-
         PointerBuffer pData = stack.mallocPointer(1);
         vkMapMemory(device, pMemory.get(0), 0, bufferSize, 0, pData);
         memCopy(memAddress(data), pData.get(0), bufferSize);
@@ -804,22 +793,26 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Creates the DescriptorSetLayout.
-     * Now includes binding 4 for the Camera UBO.
+     * UPDATED for Phase 5 (Added binding 5 for accumulation image).
      */
     private void createDescriptorSetLayout(MemoryStack stack) {
-        VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(5, stack);
+        // --- UPDATED: 6 bindings total ---
+        VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(6, stack);
 
         bindings.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT); // resultImage (Write)
         bindings.get(1).binding(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT); // triBuf
         bindings.get(2).binding(2).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT); // matBuf
         bindings.get(3).binding(3).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
-        // NEW Binding 4: Camera UBO
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT); // bvhBuf
         bindings.get(4).binding(4).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
-                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT); // cameraUbo
+
+        // --- NEW (Phase 5): Binding 5 for previous frame (accumulation) ---
+        bindings.get(5).binding(5).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT); // prevResultImage (Read)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
@@ -831,11 +824,11 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Creates only the PipelineLayout.
+     * (No changes from Phase 4)
      */
     private void createPipelineLayout(MemoryStack stack) {
         VkPushConstantRange.Buffer pushConstantRange = VkPushConstantRange.calloc(1, stack)
                 .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(4); // int numTriangles
-
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
                 .pSetLayouts(stack.longs(descriptorSetLayout))
@@ -847,6 +840,7 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Creates only the ComputePipeline.
+     * (No changes from Phase 4)
      */
     private void createComputePipeline(MemoryStack stack) {
         try {
@@ -872,10 +866,12 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Creates only the DescriptorPool.
+     * UPDATED for Phase 5 (More storage images).
      */
     private void createDescriptorPool(MemoryStack stack) {
         VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(3, stack);
-        poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
+        // --- UPDATED: 2 storage images (current frame + prev frame) ---
+        poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2);
         poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(3); // Tri, Mat, BVH
         poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1); // Camera
 
@@ -892,6 +888,7 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Allocates our single descriptor set.
+     * (No changes from Phase 4)
      */
     private void allocateDescriptorSet(MemoryStack stack) {
         VkDescriptorSetAllocateInfo allocSetInfo = VkDescriptorSetAllocateInfo.calloc(stack)
@@ -907,11 +904,18 @@ public class VulkanEngine implements Runnable {
 
     /**
      * Updates our single reusable descriptor set.
-     * Called by init() and internalSwapScene().
+     * UPDATED for Phase 5 (Added binding 5 for accumulation image).
      */
     private void updateDescriptorSet(MemoryStack stack, long triangleBuffer, long materialBuffer, long bvhBuffer, long cameraBuffer) {
 
+        // --- UPDATED: 2 image descriptors ---
         VkDescriptorImageInfo.Buffer imageDescriptor = VkDescriptorImageInfo.calloc(1, stack)
+                .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
+                .imageView(computeImageView);
+
+        // (NEW) The 'previous frame' image is the *same* image,
+        // just read from a different binding.
+        VkDescriptorImageInfo.Buffer prevImageDescriptor = VkDescriptorImageInfo.calloc(1, stack)
                 .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .imageView(computeImageView);
 
@@ -927,11 +931,12 @@ public class VulkanEngine implements Runnable {
         VkDescriptorBufferInfo.Buffer cameraBufferDescriptor = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(cameraBuffer).offset(0).range(VK_WHOLE_SIZE);
 
-        VkWriteDescriptorSet.Buffer descriptorWrites = VkWriteDescriptorSet.calloc(5, stack);
+        // --- UPDATED: 6 descriptor writes ---
+        VkWriteDescriptorSet.Buffer descriptorWrites = VkWriteDescriptorSet.calloc(6, stack);
 
         descriptorWrites.get(0).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
                 .dstBinding(0).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                .descriptorCount(1).pImageInfo(imageDescriptor);
+                .descriptorCount(1).pImageInfo(imageDescriptor); // Current Frame (Write)
         descriptorWrites.get(1).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
                 .dstBinding(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).pBufferInfo(triangleBufferDescriptor);
@@ -941,10 +946,14 @@ public class VulkanEngine implements Runnable {
         descriptorWrites.get(3).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
                 .dstBinding(3).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).pBufferInfo(bvhBufferDescriptor);
-        // NEW Binding 4 (Camera UBO)
         descriptorWrites.get(4).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
                 .dstBinding(4).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
                 .descriptorCount(1).pBufferInfo(cameraBufferDescriptor);
+
+        // --- NEW (Phase 5): Binding 5 (Prev Frame) ---
+        descriptorWrites.get(5).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet)
+                .dstBinding(5).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                .descriptorCount(1).pImageInfo(prevImageDescriptor); // Prev Frame (Read)
 
         vkUpdateDescriptorSets(device, descriptorWrites, null);
     }
@@ -1008,8 +1017,9 @@ public class VulkanEngine implements Runnable {
 
             int sourceStage, destStage;
             if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+                // --- UPDATED (Phase 5): Access mask must allow both read and write ---
                 barrier.srcAccessMask(0);
-                barrier.dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT);
+                barrier.dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
                 sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
                 destStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             } else {

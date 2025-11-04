@@ -1,0 +1,291 @@
+#version 450
+
+precision highp float; // Precision fix
+
+/*
+ * Phase 5: Gelişmiş Render Kontrolleri (Gürültü & Gökyüzü)
+ * - Artık UBO'dan frameCount ve isSkyEnabled okuyor.
+ * - Gürültüyü azaltmak (denoise) için binding 5'ten bir önceki kareyi okuyor.
+ * - Gökyüzü ışığını (isSkyEnabled) kapatmayı destekliyor.
+ */
+
+// --- Structs ---
+struct Vertex { vec3 pos; float pad; };
+struct Material { vec3 albedo; float type; }; // type: 0=Lambert, 1=Metal, 2=Fuzzy, 3=Emissive
+struct Ray { vec3 origin; vec3 dir; };
+struct LinearBVHNode {
+    vec3 bbox_min; float pad1;
+    vec3 bbox_max; float pad2;
+    int data;
+    int count;
+};
+
+// --- BINDINGS (Veri Bağlantıları) ---
+layout(rgba8, set = 0, binding = 0) uniform restrict writeonly image2D resultImage;
+layout(std430, set = 0, binding = 1) buffer TriangleBuffer { Vertex vertices[]; } triBuf;
+layout(std430, set = 0, binding = 2) buffer MaterialBuffer { Material materials[]; } matBuf;
+layout(std430, set = 0, binding = 3) buffer BVHBuffer { LinearBVHNode nodes[]; } bvhBuf;
+
+// --- YENİ (Phase 5): UBO Güncellendi ---
+layout(std140, set = 0, binding = 4) uniform CameraUBO {
+    vec3 origin;
+    vec3 lower_left_corner;
+    vec3 horizontal;
+    vec3 vertical;
+// (offset 64)
+    int frameCount;   // Gürültü azaltma için kare sayacı
+    int isSkyEnabled; // Gökyüzü ışığı (1=Açık, 0=Kapalı)
+} cam;
+
+// --- YENİ (Phase 5): Bir Önceki Kare (Gürültü Azaltma) ---
+layout(rgba8, set = 0, binding = 5) uniform restrict readonly image2D prevResultImage;
+
+
+// --- Push Constants ---
+layout(push_constant) uniform Constants {
+    int numTriangles;
+} constants;
+
+// --- Constants ---
+const float T_MIN = 0.001;
+const float T_MAX = 10000.0;
+const int   MAX_BOUNCES = 10;
+const float MAT_LAMBERTIAN = 0.0;
+const float MAT_METAL      = 1.0;
+const float MAT_METAL_FUZZY= 2.0;
+const float MAT_EMISSIVE   = 3.0;
+
+// --- Random Number Generator (RNG) ---
+uint seed;
+
+uint pcg(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randomFloat() {
+    seed = pcg(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+vec3 randomVec3InUnitSphere() {
+    vec3 pt = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
+    for(;;) {
+        vec3 p = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
+        if (dot(p, p) < 1.0) return p;
+    }
+    return pt;
+}
+
+vec3 randomUnitVector() {
+    return normalize(randomVec3InUnitSphere());
+}
+
+// --- Helper Functions ---
+vec3 ray_at(Ray r, float t) {
+    return r.origin + r.dir * t;
+}
+
+// Gökyüzü rengi (sönük)
+vec3 getSkyColor(Ray r) {
+    vec3 unit_direction = normalize(r.dir);
+    float t = 0.5 * (unit_direction.y + 1.0);
+    vec3 color = (1.0 - t) * vec3(1.0) + t * vec3(0.5, 0.7, 1.0);
+    return color * 0.1; // Sönük gökyüzü
+}
+
+// Yansıma (İsim değişikliği yapıldı)
+vec3 my_reflect(vec3 v, vec3 n) {
+    return v - 2.0 * dot(v, n) * n;
+}
+
+// --- Hit Tests ---
+bool hit_aabb(Ray r, vec3 bbox_min, vec3 bbox_max, float t_min, float t_max) {
+    vec3 invDir = 1.0 / r.dir;
+    vec3 t0s = (bbox_min - r.origin) * invDir;
+    vec3 t1s = (bbox_max - r.origin) * invDir;
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+
+    float t_enter = max(tmin.x, tmin.y);
+    t_enter = max(t_enter, tmin.z);
+    float t_exit = min(tmax.x, tmax.y);
+    t_exit = min(t_exit, tmax.z);
+
+    return t_exit > t_enter && t_exit > t_min && t_enter < t_max;
+}
+
+bool hit_triangle(Ray r, vec3 v0, vec3 v1, vec3 v2, inout float closest_t, out vec3 hit_normal) {
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 ray_cross_e2 = cross(r.dir, edge2);
+    float det = dot(edge1, ray_cross_e2);
+    if (det > -0.00001 && det < 0.00001) return false;
+
+    float inv_det = 1.0 / det;
+    vec3 s = r.origin - v0;
+    float u = inv_det * dot(s, ray_cross_e2);
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 s_cross_e1 = cross(s, edge1);
+    float v = inv_det * dot(r.dir, s_cross_e1);
+    if (v < 0.0 || (u + v) > 1.0) return false;
+
+    float t = inv_det * dot(edge2, s_cross_e1);
+    if (t > T_MIN && t < closest_t) {
+        closest_t = t;
+        hit_normal = normalize(cross(edge1, edge2));
+        if (dot(r.dir, hit_normal) > 0.0) hit_normal = -hit_normal; // Double-sided
+        return true;
+    }
+    return false;
+}
+
+// --- Material Scatter Function ---
+bool scatter(Ray r_in, int mat_index, vec3 hit_pos, vec3 hit_normal,
+out vec3 attenuation, out Ray scattered) {
+
+    Material mat = matBuf.materials[mat_index];
+
+    if (mat.type == MAT_LAMBERTIAN) {
+        vec3 scatter_direction = hit_normal + randomUnitVector();
+        if (length(scatter_direction) < 0.0001) scatter_direction = hit_normal;
+        scattered   = Ray(hit_pos, normalize(scatter_direction));
+        attenuation = mat.albedo;
+        return true;
+    }
+
+    if (mat.type == MAT_METAL || mat.type == MAT_METAL_FUZZY) {
+        float fuzz    = (mat.type == MAT_METAL_FUZZY) ? 0.3 : 0.0;
+        vec3 reflected= my_reflect(normalize(r_in.dir), hit_normal);
+        scattered     = Ray(hit_pos, normalize(reflected + fuzz * randomVec3InUnitSphere()));
+        attenuation   = mat.albedo;
+        return (dot(scattered.dir, hit_normal) > 0.0);
+    }
+
+    return false; // MAT_EMISSIVE or unknown
+}
+
+// --- MAIN SHADER ---
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 image_size   = imageSize(resultImage);
+    if (pixel_coords.x >= image_size.x || pixel_coords.y >= image_size.y) return;
+
+    // --- YENİ (Phase 5): frameCount'i kullanarak RNG tohumunu her karede değiştir ---
+    // Bu, gürültünün her karede farklı olmasını ve ortalamasının alınabilmesini sağlar
+    seed = (pixel_coords.y * image_size.x + pixel_coords.x) + (cam.frameCount * 16807u);
+
+    // Anti-Aliasing (Y-flip)
+    float u = (float(pixel_coords.x) + randomFloat()) / float(image_size.x);
+    float v = (float(image_size.y - 1 - pixel_coords.y) + randomFloat()) / float(image_size.y);
+
+    // Camera Ray
+    Ray r;
+    r.origin = cam.origin;
+    r.dir = normalize(cam.lower_left_corner + cam.horizontal * u + cam.vertical * v - cam.origin);
+
+    // Path Tracing
+    vec3 current_color = vec3(0.0); // Bu karenin rengi
+    vec3 attenuation = vec3(1.0);
+
+    for (int b = 0; b < MAX_BOUNCES; b++) {
+
+        float closest_t = T_MAX;
+        int   hit_triangle_index = -1;
+        vec3  hit_normal = vec3(0.0);
+
+        int stack[64];
+        int stackPtr = 0;
+        stack[stackPtr++] = 0; // root
+
+        while (stackPtr > 0) {
+            int nodeIndex = stack[--stackPtr];
+            LinearBVHNode node = bvhBuf.nodes[nodeIndex];
+
+            if (hit_aabb(r, node.bbox_min, node.bbox_max, T_MIN, closest_t)) {
+
+                if (node.count < 0) { // leaf
+                    int triangleIndex = -(node.data + 1);
+                    vec3 v0 = triBuf.vertices[triangleIndex * 3 + 0].pos;
+                    vec3 v1 = triBuf.vertices[triangleIndex * 3 + 1].pos;
+                    vec3 v2 = triBuf.vertices[triangleIndex * 3 + 2].pos;
+
+                    vec3 temp_normal;
+                    if (hit_triangle(r, v0, v1, v2, closest_t, temp_normal)) {
+                        hit_triangle_index = triangleIndex;
+                        hit_normal = temp_normal;
+                    }
+                } else { // internal
+                    stack[stackPtr++] = node.count; // right
+                    stack[stackPtr++] = node.data;  // left
+                }
+            }
+        } // End BVH traversal
+
+        if (hit_triangle_index != -1) {
+            // Bir objeye çarptık
+            Material mat = matBuf.materials[hit_triangle_index];
+            vec3 hit_pos = ray_at(r, closest_t);
+
+            if (mat.type == MAT_EMISSIVE) {
+                // YENİ (Phase 5): Sadece ilk sekme değil,
+                // birikmiş atenüasyonla çarp (örn. camın arkasındaki ışık)
+                current_color = attenuation * mat.albedo;
+                break;
+            }
+
+            // Yayıcı değilse, normal sektirme (scatter) yap
+            vec3 mat_attenuation;
+            Ray  scattered_ray;
+            if (scatter(r, hit_triangle_index, hit_pos, hit_normal, mat_attenuation, scattered_ray)) {
+                attenuation *= mat_attenuation; // Rengi biriktir
+                r = scattered_ray;              // Işını güncelle
+            } else {
+                attenuation = vec3(0.0); // Işın emildi
+                break;
+            }
+
+        } else {
+            // Hiçbir şeye çarpmadık (Gökyüzü)
+
+            // --- YENİ (Phase 5): Gökyüzü kontrolü ---
+            if (cam.isSkyEnabled == 1) {
+                current_color = attenuation * getSkyColor(r);
+            } else {
+                current_color = vec3(0.0); // Gökyüzü kapalı (Siyah)
+            }
+            break;
+        }
+
+        if (b == MAX_BOUNCES - 1) {
+            current_color = vec3(0.0); // Işık bulunamadı
+        }
+    } // End path tracing loop
+
+
+    // --- YENİ (Phase 5): Gürültü Azaltma / Biriktirme (Accumulation) ---
+    vec3 new_color;
+
+    if (cam.frameCount == 0) {
+        // Kamera yeni hareket etti (veya sahne değişti). Biriktirme yapma.
+        new_color = current_color;
+    } else {
+        // Kamera sabit duruyor. Önceki kareyi oku (binding 5).
+        vec3 previous_color = imageLoad(prevResultImage, pixel_coords).rgb;
+
+        // Önceki karenin gamma'sını kaldır (linear space'e dön)
+        previous_color = previous_color * previous_color;
+
+        // Yeni ortalamayı hesapla (stabil mix)
+        // Her yeni karede, o karenin toplam ortalamaya katkısı azalır.
+        float t = 1.0 / (float(cam.frameCount) + 1.0);
+        new_color = mix(previous_color, current_color, t);
+    }
+
+    // Renk Yazma (Gamma corrected)
+    new_color = sqrt(new_color);
+    imageStore(resultImage, pixel_coords, vec4(new_color, 1.0));
+}

@@ -33,7 +33,7 @@ public class VulkanRenderer {
     // --- Configuration (Could be provided by RenderLoop later; hard-coded for now) ---
     private static final int WIDTH = 1280;
     private static final int HEIGHT = 720;
-    private static final String SHADER_PATH = "shaders_spv/compute_dynamic_ray.spv";
+    private static final String SHADER_PATH = "shaders_spv/compute_with_dynamic_light_source.spv";
     private static final boolean ENABLE_VALIDATION_LAYERS = true;
 
     // --- Vulkan Core Objects ---

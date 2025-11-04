@@ -10,6 +10,8 @@ import dev.demir.vulkan.util.Vec3;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
+import javax.swing.event.ChangeEvent; // NEW Import
+import javax.swing.event.ChangeListener; // NEW Import
 import javax.swing.filechooser.FileFilter;
 import java.awt.*;
 import java.awt.event.ActionEvent;
@@ -23,11 +25,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Phase 3: Path Tracing Update
- * 1. (NEW) Added Material Type ComboBox to UI.
- * 2. All comments are in English.
- * 3. Key Bindings are Q/E for Up/Down.
- * 4. Uses Uniform Scale.
+ * Phase 5: (UI Refactor)
+ * 1. (REQUEST) Re-organized control panel into "Global Settings" and
+ * "Object Properties" using GridBagLayout for a cleaner look.
+ * 2. (REQUEST) Added a stubbed "Exposure" JSlider to Global Settings.
+ * 3. All other logic (Sky Toggle, Accumulation, Keys) is retained.
  */
 public class VulkanApp {
 
@@ -50,8 +52,10 @@ public class VulkanApp {
     private JComboBox<ColorPreset> colorComboBox;
     private JPanel rgbPanel;
     private JSpinner colorRSpinner, colorGSpinner, colorBSpinner;
-    // --- NEW: Material UI ---
     private JComboBox<MaterialPreset> materialComboBox;
+    // --- NEW: Global Controls ---
+    private JCheckBox enableSkyCheckBox;
+    private JSlider exposureSlider;
 
     private JButton applyChangesButton;
     private ModelInstance selectedInstance = null;
@@ -80,7 +84,7 @@ public class VulkanApp {
         public String toString() { return name; } // This shows in the ComboBox
     }
 
-    // --- NEW: Helper class for Material ComboBox ---
+    // --- Helper class for Material ComboBox ---
     private static class MaterialPreset {
         private final String name;
         private final float type;
@@ -119,7 +123,7 @@ public class VulkanApp {
     public VulkanApp() {
         this.vulkanEngine = new VulkanEngine(latestFrame);
         this.camera = new Camera(
-                new Vec3(-22, 18, 60), // origin
+                new Vec3(-25, 30, 140), // origin
                 new Vec3(0, 0, 0),  // lookAt
                 new Vec3(0, 1, 0),  // vUp
                 20.0,               // vfov
@@ -129,7 +133,7 @@ public class VulkanApp {
 
     public void run() {
         // 1. Set up Swing UI
-        frame = new JFrame("Vulkan BVH Ray Tracer (Smart Engine)");
+        frame = new JFrame("Vulkan BVH Ray Tracer");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         bufferedImage = new BufferedImage(RENDER_WIDTH, RENDER_HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
         imageLabel = new JLabel(new ImageIcon(bufferedImage));
@@ -150,9 +154,10 @@ public class VulkanApp {
 
         // 3. Trigger initial scene build (SRT)
         populateDefaultScene();
-        rebuildSceneAsync();
+        rebuildSceneAsync(); // This will also call resetAccumulation
 
         // 4. Send initial camera state to the engine
+        camera.resetAccumulation(); // Ensure first frame is clean
         vulkanEngine.submitCameraUpdate(camera);
 
         // 5. Start UI Timer
@@ -185,7 +190,9 @@ public class VulkanApp {
         }
         long now = System.nanoTime();
         if (now - lastFrameTime >= 1_000_000_000) {
-            frame.setTitle(String.format("Vulkan BVH Ray Tracer (Smart Engine) | %d FPS", frameCount));
+            // Update FPS counter and also show accumulated frames
+            int accumulatedFrames = (camera != null) ? camera.getFrameCount() : 0;
+            frame.setTitle(String.format("Vulkan Ray Tracer | %d FPS | Samples: %d", frameCount, accumulatedFrames));
             frameCount = 0;
             lastFrameTime = now;
         }
@@ -201,6 +208,11 @@ public class VulkanApp {
         }
         sceneBuildInProgress = true;
         System.out.println("LOG (UI): Triggering asynchronous scene build (SRT)...");
+
+        // FIX: Reset accumulation whenever the scene is rebuilt
+        camera.resetAccumulation();
+        vulkanEngine.submitCameraUpdate(camera); // Send reset to engine
+
         final Scene sceneSnapshot = scene.createSnapshot();
         CompletableFuture
                 .supplyAsync(() -> sceneBuilder.buildScene(sceneSnapshot))
@@ -217,12 +229,12 @@ public class VulkanApp {
     }
 
     /**
-     * Loads the default scene ('ground_plane.obj' and 'car.obj')
+     * Loads the default scene ('ground_plane.obj', 'car.obj', 'sun.obj')
      */
     private void populateDefaultScene() {
         System.out.println("LOG (UI): Populating default scene...");
 
-        // --- Use 'ground_plane.obj' ---
+        // --- GROUND (Matte) ---
         ModelInstance plane = new ModelInstance("ground_plane.obj", "Ground Plane");
         plane.setPosition(new Vec3(0, -10, 0));
         plane.setScale(new Vec3(150, 1, 150)); // Non-uniform scale
@@ -231,19 +243,34 @@ public class VulkanApp {
         scene.addInstance(plane);
         listModel.addElement(plane);
 
+        // --- CAR (Metal) ---
         ModelInstance car = new ModelInstance("car.obj", "Car");
-        car.setPosition(new Vec3(0, -8, 0)); // Move car slightly above the ground plane (Y=-10)
+        car.setPosition(new Vec3(0, -8, 0));
         car.setScale(new Vec3(2, 2, 2));
-        car.setColor(new Vec3(0.82, 0.07, 0.42)); // "Custom" color
+        car.setColor(new Vec3(0.6, 0.7, 0.1));
         car.setMaterialType(1.0f); // 1.0f = Metal
         scene.addInstance(car);
         listModel.addElement(car);
 
-        sceneObjectList.setSelectedValue(car, true);
+        // --- LIGHT SOURCE (Emissive) ---
+        ModelInstance light = new ModelInstance("sun.obj", "Light Source");
+        light.setPosition(new Vec3(0, 220, 0));
+        light.setScale(new Vec3(0.35, 0.35, 0.35));
+        light.setColor(new Vec3(4.0, 4.0, 4.0)); // Bright white ( > 1.0)
+        light.setMaterialType(3.0f); // 3.0f = Emissive
+        scene.addInstance(light);
+        listModel.addElement(light);
+
+
+        sceneObjectList.setSelectedValue(car, true); // Select the car by default
     }
 
+
+    // --- UI HELPER METHODS (REFACTORED FOR GridBagLayout) ---
+
     /**
-     * Creates all the UI controls for managing the scene.
+     * Creates the main control panel and all its sub-panels.
+     * REFACTORED for a cleaner GridBagLayout.
      */
     private void setupSceneControls() {
         controlPanel = new JPanel();
@@ -251,7 +278,7 @@ public class VulkanApp {
         controlPanel.setPreferredSize(new Dimension(300, RENDER_HEIGHT));
         controlPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        // --- 1. Scene Object List ---
+        // --- 1. Scene Object List Panel ---
         JPanel listPanel = new JPanel(new BorderLayout());
         listPanel.setBorder(new TitledBorder("Scene Objects"));
         listModel = new DefaultListModel<>();
@@ -264,7 +291,6 @@ public class VulkanApp {
                 updateSpinnersFromInstance();
             }
         });
-        controlPanel.add(listPanel);
 
         // --- 2. List Control Buttons ---
         JPanel buttonPanel = new JPanel(new FlowLayout());
@@ -274,44 +300,127 @@ public class VulkanApp {
         removeButton.addActionListener(e -> removeSelectedInstance());
         buttonPanel.add(addButton);
         buttonPanel.add(removeButton);
+
+        // --- 3. Global Settings Panel (NEW) ---
+        JPanel globalSettingsPanel = createGlobalSettingsPanel();
+
+        // --- 4. Object Properties Panel ---
+        JPanel propertiesPanel = createObjectPropertiesPanel();
+
+        // --- Add all panels to the main control panel ---
+        controlPanel.add(listPanel);
         controlPanel.add(buttonPanel);
+        controlPanel.add(globalSettingsPanel); // Add new global panel
+        controlPanel.add(propertiesPanel);
+        controlPanel.add(Box.createVerticalGlue()); // Push controls to the top
+    }
 
-        // --- 3. Property Editor ---
-        JPanel propertiesPanel = new JPanel();
-        propertiesPanel.setLayout(new BoxLayout(propertiesPanel, BoxLayout.Y_AXIS));
-        propertiesPanel.setBorder(new TitledBorder("Properties"));
+    /**
+     * NEW: Creates the "Global Settings" panel.
+     */
+    private JPanel createGlobalSettingsPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(new TitledBorder("Global Settings"));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(2, 5, 2, 5);
+        gbc.weightx = 1.0;
 
-        // Position Spinners
-        posXSpinner = createSpinnerPanel(propertiesPanel, "Pos X:", -1000.0, 1000.0, 0.0, 1.0);
-        posYSpinner = createSpinnerPanel(propertiesPanel, "Pos Y:", -1000.0, 1000.0, 0.0, 1.0);
-        posZSpinner = createSpinnerPanel(propertiesPanel, "Pos Z:", -1000.0, 1000.0, 0.0, 1.0);
+        // --- Enable Sky Light CheckBox ---
+        enableSkyCheckBox = new JCheckBox("Enable Sky Light", true);
+        enableSkyCheckBox.addActionListener(e -> {
+            boolean isSkyEnabled = enableSkyCheckBox.isSelected();
+            vulkanEngine.submitSkyToggle(isSkyEnabled);
+            camera.resetAccumulation();
+            vulkanEngine.submitCameraUpdate(camera);
+        });
+        addLabelAndComponent(panel, "", enableSkyCheckBox, gbc, 0); // No label
 
-        // Uniform Scale Spinner
-        uniformScaleSpinner = createSpinnerPanel(propertiesPanel, "Scale:", -100.0, 100.0, 1.0, 0.1);
+        // --- Exposure (Composure) Slider ---
+        exposureSlider = new JSlider(JSlider.HORIZONTAL, -50, 50, 0); // Range -5.0 to +5.0 (x10)
+        exposureSlider.setMajorTickSpacing(25);
+        exposureSlider.setMinorTickSpacing(5);
+        exposureSlider.setPaintTicks(true);
+        exposureSlider.setPaintLabels(false); // Labels would be -50, 0, 50. Not user-friendly.
 
-        // Color ComboBox
-        JPanel colorComboPanel = new JPanel(new BorderLayout(5, 5));
-        colorComboPanel.add(new JLabel("Color:"), BorderLayout.WEST);
+        exposureSlider.addChangeListener(e -> {
+            if (!exposureSlider.getValueIsAdjusting()) {
+                // Only update when the user releases the slider
+                float exposureValue = exposureSlider.getValue() / 10.0f;
+                System.out.println("LOG (UI): Exposure set to: " + exposureValue);
+
+                // --- TODO: Send exposure value to VulkanEngine ---
+                // We need a new UBO field and submit method for this.
+                // vulkanEngine.submitExposureUpdate(exposureValue);
+
+                camera.resetAccumulation();
+                vulkanEngine.submitCameraUpdate(camera);
+            }
+        });
+        addLabelAndComponent(panel, "Exposure:", exposureSlider, gbc, 1);
+
+        return panel;
+    }
+
+    /**
+     * NEW: Creates the "Object Properties" panel.
+     */
+    private JPanel createObjectPropertiesPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(new TitledBorder("Object Properties"));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(2, 5, 2, 5);
+        gbc.weightx = 1.0;
+        int row = 0;
+
+        // --- Create all components ---
+        posXSpinner = new JSpinner(new SpinnerNumberModel(0.0, -1000.0, 1000.0, 1.0));
+        posYSpinner = new JSpinner(new SpinnerNumberModel(0.0, -1000.0, 1000.0, 1.0));
+        posZSpinner = new JSpinner(new SpinnerNumberModel(0.0, -1000.0, 1000.0, 1.0));
+        uniformScaleSpinner = new JSpinner(new SpinnerNumberModel(1.0, -100.0, 100.0, 0.1));
+
         colorComboBox = new JComboBox<>(new ColorPreset[]{
                 new ColorPreset("Grey", new Vec3(0.5, 0.5, 0.5)),
                 new ColorPreset("White", new Vec3(1.0, 1.0, 1.0)),
                 new ColorPreset("Red", new Vec3(1.0, 0.0, 0.0)),
                 new ColorPreset("Green", new Vec3(0.0, 1.0, 0.0)),
                 new ColorPreset("Blue", new Vec3(0.0, 0.0, 1.0)),
-                new ColorPreset("Custom...", null) // 'null' signals custom
+                new ColorPreset("Custom...", null)
         });
-        colorComboPanel.add(colorComboBox, BorderLayout.CENTER);
-        propertiesPanel.add(colorComboPanel);
 
-        // Custom RGB Panel
-        rgbPanel = new JPanel();
-        rgbPanel.setLayout(new BoxLayout(rgbPanel, BoxLayout.Y_AXIS));
-        rgbPanel.setBorder(BorderFactory.createEmptyBorder(5, 10, 5, 0)); // Indent
-        colorRSpinner = createSpinnerPanel(rgbPanel, "R:", 0.0, 1.0, 0.8, 0.01);
-        colorGSpinner = createSpinnerPanel(rgbPanel, "G:", 0.0, 1.0, 0.8, 0.01);
-        colorBSpinner = createSpinnerPanel(rgbPanel, "B:", 0.0, 1.0, 0.8, 0.01);
-        propertiesPanel.add(rgbPanel);
-        rgbPanel.setVisible(false); // Hide by default
+        materialComboBox = new JComboBox<>(new MaterialPreset[]{
+                new MaterialPreset("Matte (Lambertian)", 0.0f),
+                new MaterialPreset("Metal (Shiny)", 1.0f),
+                new MaterialPreset("Metal (Fuzzy)", 2.0f),
+                new MaterialPreset("Emissive (Light)", 3.0f)
+        });
+
+        // --- Add components to panel using GridBagLayout ---
+        addLabelAndComponent(panel, "Pos X:", posXSpinner, gbc, row++);
+        addLabelAndComponent(panel, "Pos Y:", posYSpinner, gbc, row++);
+        addLabelAndComponent(panel, "Pos Z:", posZSpinner, gbc, row++);
+        addLabelAndComponent(panel, "Scale:", uniformScaleSpinner, gbc, row++);
+        addLabelAndComponent(panel, "Color:", colorComboBox, gbc, row++);
+
+        // --- Custom RGB Panel ---
+        rgbPanel = new JPanel(new GridBagLayout());
+        colorRSpinner = new JSpinner(new SpinnerNumberModel(0.8, 0.0, 1.0, 0.01));
+        colorGSpinner = new JSpinner(new SpinnerNumberModel(0.8, 0.0, 1.0, 0.01));
+        colorBSpinner = new JSpinner(new SpinnerNumberModel(0.8, 0.0, 1.0, 0.01));
+
+        // Add RGB spinners to their own panel
+        GridBagConstraints rgbGbc = new GridBagConstraints();
+        rgbGbc.insets = new Insets(0, 2, 0, 2);
+        rgbGbc.weightx = 1.0;
+        addLabelAndComponent(rgbPanel, "R:", colorRSpinner, rgbGbc, 0);
+        addLabelAndComponent(rgbPanel, "G:", colorGSpinner, rgbGbc, 1);
+        addLabelAndComponent(rgbPanel, "B:", colorBSpinner, rgbGbc, 2);
+
+        // Add the rgbPanel itself to the main properties panel
+        gbc.gridx = 1; // Align under the ComboBox
+        gbc.gridy = row++;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        panel.add(rgbPanel, gbc);
+        rgbPanel.setVisible(false);
 
         // Color ComboBox listener
         colorComboBox.addActionListener(e -> {
@@ -320,57 +429,68 @@ public class VulkanApp {
             frame.pack(); // Adjust window size
         });
 
-        // --- NEW: Material Type ComboBox ---
-        JPanel materialComboPanel = new JPanel(new BorderLayout(5, 5));
-        materialComboPanel.add(new JLabel("Material:"), BorderLayout.WEST);
-        materialComboBox = new JComboBox<>(new MaterialPreset[]{
-                new MaterialPreset("Matte (Lambertian)", 0.0f),
-                new MaterialPreset("Metal (Shiny)", 1.0f),
-                new MaterialPreset("Metal (Fuzzy)", 2.0f)
-        });
-        materialComboPanel.add(materialComboBox, BorderLayout.CENTER);
-        propertiesPanel.add(materialComboPanel);
-        // --- End of New Code ---
+        addLabelAndComponent(panel, "Material:", materialComboBox, gbc, row++);
 
-        // "Apply" Button
+        // --- Add "Apply Changes" button ---
         applyChangesButton = new JButton("Apply Changes & Rebuild");
         applyChangesButton.addActionListener(e -> {
             applyChangesToInstance();
+            camera.resetAccumulation(); // Reset noise
             rebuildSceneAsync();
         });
-        JPanel applyPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
-        applyPanel.add(applyChangesButton);
-        propertiesPanel.add(applyPanel);
 
-        controlPanel.add(propertiesPanel);
-        controlPanel.add(Box.createVerticalGlue()); // Push controls to the top
+        gbc.gridx = 0;
+        gbc.gridy = row++;
+        gbc.gridwidth = 2; // Span both columns
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        panel.add(applyChangesButton, gbc);
+
+        // Add listeners to spinners for "Enter" key
+        addSpinnerEnterListener(posXSpinner);
+        addSpinnerEnterListener(posYSpinner);
+        addSpinnerEnterListener(posZSpinner);
+        addSpinnerEnterListener(uniformScaleSpinner);
+        addSpinnerEnterListener(colorRSpinner);
+        addSpinnerEnterListener(colorGSpinner);
+        addSpinnerEnterListener(colorBSpinner);
+
+        return panel;
     }
 
     /**
-     * Helper method to create a Label + Spinner row.
+     * NEW: Helper to add a label and component in a clean grid row.
      */
-    private JSpinner createSpinnerPanel(JPanel container, String label, double min, double max, double value, double step) {
-        JPanel panel = new JPanel(new BorderLayout(5, 5));
-        panel.add(new JLabel(label), BorderLayout.WEST);
-        SpinnerModel model = new SpinnerNumberModel(value, min, max, step);
-        JSpinner spinner = new JSpinner(model);
-        panel.add(spinner, BorderLayout.CENTER);
-        container.add(panel);
+    private void addLabelAndComponent(Container container, String text, Component component, GridBagConstraints gbc, int row) {
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 1;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.WEST;
+        container.add(new JLabel(text), gbc);
 
-        // Add a listener to rebuild the scene when a value is "committed" (e.g., Enter pressed)
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.anchor = GridBagConstraints.EAST;
+        container.add(component, gbc);
+    }
+
+    /**
+     * NEW: Helper to add the "Enter" key listener to a spinner's text field.
+     */
+    private void addSpinnerEnterListener(JSpinner spinner) {
         JFormattedTextField ftf = ((JSpinner.NumberEditor) spinner.getEditor()).getTextField();
         ftf.addActionListener(e -> {
             applyChangesToInstance();
+            camera.resetAccumulation();
             rebuildSceneAsync();
         });
-        return spinner;
     }
 
     /**
      * Action for the "Add Model" button.
      */
     private void addModelInstance() {
-        JFileChooser fileChooser = new JFileChooser("."); // Start in project dir
+        JFileChooser fileChooser = new JFileChooser(".");
         fileChooser.setDialogTitle("Select an OBJ Model File");
         fileChooser.setFileFilter(new FileFilter() {
             public boolean accept(File f) { return f.isDirectory() || f.getName().toLowerCase().endsWith(".obj"); }
@@ -383,7 +503,7 @@ public class VulkanApp {
             scene.addInstance(instance);
             listModel.addElement(instance);
             sceneObjectList.setSelectedValue(instance, true);
-            rebuildSceneAsync();
+            rebuildSceneAsync(); // This will reset accumulation
         }
     }
 
@@ -396,7 +516,7 @@ public class VulkanApp {
             scene.removeInstance(selectedInstance);
             listModel.removeElement(selectedInstance);
             selectedInstance = null;
-            rebuildSceneAsync();
+            rebuildSceneAsync(); // This will reset accumulation
         }
     }
 
@@ -432,12 +552,11 @@ public class VulkanApp {
             ));
         }
 
-        // --- NEW: Apply Material Type ---
+        // Apply Material Type
         MaterialPreset matPreset = (MaterialPreset) materialComboBox.getSelectedItem();
         if (matPreset != null) {
             selectedInstance.setMaterialType(matPreset.getType());
         }
-        // --- End of New Code ---
     }
 
     /**
@@ -485,7 +604,7 @@ public class VulkanApp {
             }
         }
 
-        // --- NEW: Update Material ComboBox ---
+        // Update Material ComboBox
         float matType = selectedInstance.getMaterialType();
         boolean matchedMatPreset = false;
         for (int i = 0; i < materialComboBox.getItemCount(); i++) {
@@ -499,7 +618,6 @@ public class VulkanApp {
         if (!matchedMatPreset) {
             materialComboBox.setSelectedIndex(0); // Default to first item
         }
-        // --- End of New Code ---
 
         isUpdatingUI = false; // Clear flag
     }
@@ -517,6 +635,10 @@ public class VulkanApp {
             @Override
             public void actionPerformed(ActionEvent e) {
                 camera.setOrigin(camera.getOrigin().add(moveVector));
+
+                // FIX: Reset accumulation on *every* key press
+                camera.resetAccumulation();
+
                 vulkanEngine.submitCameraUpdate(camera);
             }
         }
@@ -531,7 +653,7 @@ public class VulkanApp {
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_D, 0), "moveRight");
         actionMap.put("moveRight", new CameraAction(new Vec3(5.5, 0, 0)));
 
-        // --- FIX: Use Q (Up) and E (Down) ---
+        // Q/E (Up/Down)
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Q, 0), "moveUp");
         actionMap.put("moveUp", new CameraAction(new Vec3(0, 3.5, 0)));
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_E, 0), "moveDown");
