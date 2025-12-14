@@ -31,6 +31,6 @@ bin/
 ### Mac OS ###
 .DS_Store
 
-car.obj
-Female.obj
-sun.obj
+objects/car.obj
+objects/Female.obj
+objects/sun.obj
