@@ -10,8 +10,8 @@ import dev.demir.vulkan.util.Vec3;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
-import javax.swing.event.ChangeEvent; // NEW Import
-import javax.swing.event.ChangeListener; // NEW Import
+import javax.swing.event.ChangeEvent;
+import javax.swing.event.ChangeListener;
 import javax.swing.filechooser.FileFilter;
 import java.awt.*;
 import java.awt.event.ActionEvent;
@@ -30,6 +30,11 @@ import java.util.concurrent.atomic.AtomicReference;
  * "Object Properties" using GridBagLayout for a cleaner look.
  * 2. (REQUEST) Added a stubbed "Exposure" JSlider to Global Settings.
  * 3. All other logic (Sky Toggle, Accumulation, Keys) is retained.
+ *
+ * (3-THREAD-RACE-CONDITION-FIX): All state management (frameCount, skyEnabled)
+ * is now controlled ONLY by this class (the UI Thread).
+ * VulkanEngine is now a "dumb" renderer.
+ * Accumulation is now paused during Scene Rebuild (SRT).
  */
 public class VulkanApp {
 
@@ -71,6 +76,8 @@ public class VulkanApp {
     // --- State ---
     private long lastFrameTime = System.nanoTime();
     private int frameCount = 0;
+
+    // --- 3-THREAD-FIX: This flag pauses accumulation in updateUI() ---
     private volatile boolean sceneBuildInProgress = false;
 
     // --- Helper class for Color ComboBox ---
@@ -149,7 +156,7 @@ public class VulkanApp {
         swizzleBuffer = ((DataBufferByte) bufferedImage.getRaster().getDataBuffer()).getData();
 
         // 2. Start VulkanEngine Thread (VRT)
-        System.out.println("LOG (UI): Starting VulkanEngine...");
+        System.out.println("LOG (UI-RUN): Starting VulkanEngine...");
         vulkanEngine.start();
 
         // 3. Trigger initial scene build (SRT)
@@ -157,12 +164,13 @@ public class VulkanApp {
         rebuildSceneAsync(); // This will also call resetAccumulation
 
         // 4. Send initial camera state to the engine
-        camera.resetAccumulation(); // Ensure first frame is clean
-        vulkanEngine.submitCameraUpdate(camera);
+        // (This is now handled by rebuildSceneAsync's .whenComplete block)
+        System.out.println("LOG (UI-RUN): Waiting for first scene build...");
 
         // 5. Start UI Timer
         Timer swingTimer = new Timer(16, (e) -> updateUI());
         swingTimer.start();
+        System.out.println("LOG (UI-RUN): UI Timer started.");
 
         // 6. Set up keyboard controls
         setupKeyBindings();
@@ -171,7 +179,7 @@ public class VulkanApp {
         frame.addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
             public void windowClosing(java.awt.event.WindowEvent windowEvent) {
-                System.out.println("LOG (UI): Stopping engine...");
+                System.out.println("LOG (UI-WINDOW): Stopping engine...");
                 swingTimer.stop();
                 vulkanEngine.stop();
             }
@@ -180,8 +188,35 @@ public class VulkanApp {
 
     /**
      * Main UI loop driven by the Swing Timer.
+     * (3-THREAD-FIX): This is now the *only* place frameCount is incremented.
+     * It does *not* send sky state.
      */
     private void updateUI() {
+        String logPrefix = "LOG (UI-TIMER): ";
+
+        if (vulkanEngine != null) {
+
+            // --- 3-THREAD-FIX: PAUSE ACCUMULATION ---
+            // Only increment the frame counter if a scene rebuild (SRT)
+            // is not in progress. This ensures that when the SRT
+            // finishes, the frameCount is still 0.
+            if (!sceneBuildInProgress) {
+                camera.incrementFrameCount();
+                // System.out.println(logPrefix + "Accumulation ON. Incremented frameCount to " + camera.getFrameCount());
+            } else {
+                // System.out.println(logPrefix + "Accumulation PAUSED (SRT running). frameCount is " + camera.getFrameCount());
+            }
+
+            // --- 3-THREAD-FIX: REMOVE OVERRIDE ---
+            // DO NOT send sky state here. This was overriding the
+            // user's selection from the ActionListener.
+            // vulkanEngine.submitSkyToggle(enableSkyCheckBox.isSelected()); // <-- BUG WAS HERE
+
+            // Always send the latest camera state (with the new or paused frameCount)
+            // This drives the continuous accumulation.
+            vulkanEngine.submitCameraUpdate(camera);
+        }
+
         FrameData frameData = latestFrame.getAndSet(null);
         if (frameData != null) {
             updateBufferedImage(frameData.pixelData);
@@ -192,39 +227,79 @@ public class VulkanApp {
         if (now - lastFrameTime >= 1_000_000_000) {
             // Update FPS counter and also show accumulated frames
             int accumulatedFrames = (camera != null) ? camera.getFrameCount() : 0;
+            // System.out.println(logPrefix + "FPS Update. Samples: " + accumulatedFrames);
             frame.setTitle(String.format("Vulkan Ray Tracer | %d FPS | Samples: %d", frameCount, accumulatedFrames));
-            frameCount = 0;
+            frameCount = 20;
             lastFrameTime = now;
         }
     }
 
     /**
      * Assigns a scene build task to the SceneBuilder (SRT).
+     * (3-THREAD-FIX): This now controls the sceneBuildInProgress flag
+     * and handles resetting the camera *after* the build.
      */
     public void rebuildSceneAsync() {
+        String logPrefix = "LOG (UI-REBUILD): ";
+
         if (sceneBuildInProgress) {
-            System.out.println("LOG (UI): Scene build already in progress. Ignoring trigger.");
+            System.out.println(logPrefix + "Scene build already in progress. Ignoring trigger.");
             return;
         }
-        sceneBuildInProgress = true;
-        System.out.println("LOG (UI): Triggering asynchronous scene build (SRT)...");
 
-        // FIX: Reset accumulation whenever the scene is rebuilt
-        camera.resetAccumulation();
-        vulkanEngine.submitCameraUpdate(camera); // Send reset to engine
+        // 1. Set flag to TRUE to pause accumulation in updateUI()
+        sceneBuildInProgress = true;
+
+        System.out.println(logPrefix + "Triggering asynchronous scene build (SRT)...");
+        System.out.println(logPrefix + "Accumulation is PAUSED.");
+
+        // --- 3-THREAD-FIX: MOVE RESET TO END ---
+        // Do NOT reset the camera here. If we do, updateUI()
+        // will increment frameCount while the SRT is running.
+        // We move the reset logic into the .whenCompleteAsync block.
+        // --- END FIX ---
+
 
         final Scene sceneSnapshot = scene.createSnapshot();
         CompletableFuture
                 .supplyAsync(() -> sceneBuilder.buildScene(sceneSnapshot))
                 .whenCompleteAsync((builtCpuData, error) -> {
+                    // This block runs on the UI Thread (thanks to SwingUtilities::invokeLater)
+                    String logPrefixDone = "LOG (UI-SRT-DONE): ";
+
                     if (error != null) {
                         error.printStackTrace();
                         JOptionPane.showMessageDialog(frame, "Scene build failed: " + error.getMessage(), "SRT Error", JOptionPane.ERROR_MESSAGE);
                     } else {
-                        System.out.println("LOG (UI): SRT finished. Sending new scene to engine.");
+                        System.out.println(logPrefixDone + "SRT finished. Sending new scene to VRT...");
+
+                        // 1. Send the new scene data to the VRT.
+                        //    (VulkanEngine's submitScene is now "dumb" and doesn't reset)
                         vulkanEngine.submitScene(builtCpuData);
+                        System.out.println(logPrefixDone + "submitScene() called.");
+
+
+                        // --- 3-THREAD-FIX: RESET CAMERA *AFTER* BUILD ---
+                        // 2. Now that the scene is submitted, reset the camera
+                        //    (frameCount = 0) on the UI thread.
+                        camera.resetAccumulation();
+                        System.out.println(logPrefixDone + "camera.resetAccumulation() called. frameCount is now 0.");
+
+                        // 3. Send the current sky state AND the reset (frameCount=0)
+                        //    to the VRT. This ensures the VRT's *next* frame
+                        //    is the new scene with frame 0.
+                        boolean isSkyEnabled = enableSkyCheckBox.isSelected();
+                        vulkanEngine.submitSkyToggle(isSkyEnabled);
+                        vulkanEngine.submitCameraUpdate(camera);
+                        System.out.println(logPrefixDone + "submitSkyToggle(" + isSkyEnabled + ") and submitCameraUpdate(fc=0) called.");
+                        // --- END FIX ---
                     }
+
+                    // 4. Finally, set flag to FALSE to re-enable
+                    //    accumulation (incrementFrameCount) in updateUI().
                     sceneBuildInProgress = false;
+                    System.out.println(logPrefixDone + "Accumulation is RESUMED.");
+
                 }, SwingUtilities::invokeLater);
     }
 
@@ -232,7 +307,7 @@ public class VulkanApp {
      * Loads the default scene ('ground_plane.obj', 'car.obj', 'sun.obj')
      */
     private void populateDefaultScene() {
-        System.out.println("LOG (UI): Populating default scene...");
+        System.out.println("LOG (UI-POPULATE): Populating default scene...");
 
         // --- GROUND (Matte) ---
         ModelInstance plane = new ModelInstance("ground_plane.obj", "Ground Plane");
@@ -317,6 +392,7 @@ public class VulkanApp {
 
     /**
      * NEW: Creates the "Global Settings" panel.
+     * (3-THREAD-FIX): This is the critical fix.
      */
     private JPanel createGlobalSettingsPanel() {
         JPanel panel = new JPanel(new GridBagLayout());
@@ -328,10 +404,21 @@ public class VulkanApp {
         // --- Enable Sky Light CheckBox ---
         enableSkyCheckBox = new JCheckBox("Enable Sky Light", true);
         enableSkyCheckBox.addActionListener(e -> {
-            boolean isSkyEnabled = enableSkyCheckBox.isSelected();
+            // This is an "event". It resets accumulation.
+            boolean isSkyEnabled = enableSkyCheckBox.isSelected(); // Get the new state
+            System.out.println("LOG (UI-EVENT-SKY): Sky CheckBox clicked. Sending state: " + isSkyEnabled);
+
+            // 1. Send the new state
             vulkanEngine.submitSkyToggle(isSkyEnabled);
+
+            // 2. Reset the counter
             camera.resetAccumulation();
+            System.out.println("LOG (UI-EVENT-SKY): camera.resetAccumulation() called. frameCount is now 0.");
+
+            // 3. Send the reset (frameCount=0)
+            // !!! BU SATIR BÜYÜK İHTİMALLE EKSİKTİ !!!
             vulkanEngine.submitCameraUpdate(camera);
+            System.out.println("LOG (UI-EVENT-SKY): submitCameraUpdate(fc=0) called.");
         });
         addLabelAndComponent(panel, "", enableSkyCheckBox, gbc, 0); // No label
 
@@ -344,16 +431,20 @@ public class VulkanApp {
 
         exposureSlider.addChangeListener(e -> {
             if (!exposureSlider.getValueIsAdjusting()) {
-                // Only update when the user releases the slider
+                // This is an "event". It resets accumulation.
                 float exposureValue = exposureSlider.getValue() / 10.0f;
-                System.out.println("LOG (UI): Exposure set to: " + exposureValue);
+                System.out.println("LOG (UI-EVENT-EXPOSURE): Exposure set to: " + exposureValue);
 
                 // --- TODO: Send exposure value to VulkanEngine ---
-                // We need a new UBO field and submit method for this.
                 // vulkanEngine.submitExposureUpdate(exposureValue);
 
-                camera.resetAccumulation();
-                vulkanEngine.submitCameraUpdate(camera);
+                camera.resetAccumulation(); // 1. Reset the counter
+                System.out.println("LOG (UI-EVENT-EXPOSURE): camera.resetAccumulation() called. frameCount is now 0.");
+                // 2. Send the *current* sky state along with the reset
+                boolean isSkyEnabled = enableSkyCheckBox.isSelected();
+                vulkanEngine.submitSkyToggle(isSkyEnabled);
+                vulkanEngine.submitCameraUpdate(camera); // 3. Send the reset (frameCount=0)
+                System.out.println("LOG (UI-EVENT-EXPOSURE): submitSkyToggle(" + isSkyEnabled + ") and submitCameraUpdate(fc=0) called.");
             }
         });
         addLabelAndComponent(panel, "Exposure:", exposureSlider, gbc, 1);
@@ -434,9 +525,10 @@ public class VulkanApp {
         // --- Add "Apply Changes" button ---
         applyChangesButton = new JButton("Apply Changes & Rebuild");
         applyChangesButton.addActionListener(e -> {
+            System.out.println("LOG (UI-EVENT-APPLY): 'Apply Changes' clicked.");
             applyChangesToInstance();
-            camera.resetAccumulation(); // Reset noise
-            rebuildSceneAsync();
+            // This is an "event". It triggers the (now safe) rebuild.
+            rebuildSceneAsync(); // This will handle the reset
         });
 
         gbc.gridx = 0;
@@ -480,9 +572,10 @@ public class VulkanApp {
     private void addSpinnerEnterListener(JSpinner spinner) {
         JFormattedTextField ftf = ((JSpinner.NumberEditor) spinner.getEditor()).getTextField();
         ftf.addActionListener(e -> {
+            System.out.println("LOG (UI-EVENT-SPINNER): 'Enter' pressed on spinner.");
             applyChangesToInstance();
-            camera.resetAccumulation();
-            rebuildSceneAsync();
+            // This is an "event".
+            rebuildSceneAsync(); // This will handle the reset
         });
     }
 
@@ -498,12 +591,13 @@ public class VulkanApp {
         });
         int result = fileChooser.showOpenDialog(frame);
         if (result == JFileChooser.APPROVE_OPTION) {
+            System.out.println("LOG (UI-EVENT-ADD): 'Add Model' approved.");
             File file = fileChooser.getSelectedFile();
             ModelInstance instance = new ModelInstance(file.getPath(), file.getName());
             scene.addInstance(instance);
             listModel.addElement(instance);
             sceneObjectList.setSelectedValue(instance, true);
-            rebuildSceneAsync(); // This will reset accumulation
+            rebuildSceneAsync(); // This will handle the reset
         }
     }
 
@@ -512,11 +606,11 @@ public class VulkanApp {
      */
     private void removeSelectedInstance() {
         if (selectedInstance != null) {
-            System.out.println("LOG (UI): Removing model: " + selectedInstance.getDisplayName());
+            System.out.println("LOG (UI-EVENT-REMOVE): Removing model: " + selectedInstance.getDisplayName());
             scene.removeInstance(selectedInstance);
             listModel.removeElement(selectedInstance);
             selectedInstance = null;
-            rebuildSceneAsync(); // This will reset accumulation
+            rebuildSceneAsync(); // This will handle the reset
         }
     }
 
@@ -527,7 +621,7 @@ public class VulkanApp {
      */
     private void applyChangesToInstance() {
         if (selectedInstance == null || isUpdatingUI) return;
-        System.out.println("LOG (UI): Applying changes to " + selectedInstance.getDisplayName());
+        System.out.println("LOG (UI-APPLY): Applying property changes to " + selectedInstance.getDisplayName());
 
         // Position
         selectedInstance.setPosition(new Vec3(
@@ -565,6 +659,7 @@ public class VulkanApp {
     private void updateSpinnersFromInstance() {
         if (selectedInstance == null) return;
         isUpdatingUI = true; // Set flag to prevent feedback loop
+        // System.out.println("LOG (UI-SPINNER): Updating spinners from instance. UI events disabled.");
 
         // Position
         Vec3 pos = selectedInstance.getPosition();
@@ -619,6 +714,7 @@ public class VulkanApp {
             materialComboBox.setSelectedIndex(0); // Default to first item
         }
 
+        // System.out.println("LOG (UI-SPINNER): Spinners updated. UI events re-enabled.");
         isUpdatingUI = false; // Clear flag
     }
 
@@ -630,34 +726,45 @@ public class VulkanApp {
         ActionMap actionMap = imageLabel.getActionMap();
 
         class CameraAction extends AbstractAction {
+            private final String key;
             private final Vec3 moveVector;
-            CameraAction(Vec3 moveVector) { this.moveVector = moveVector; }
+            CameraAction(String key, Vec3 moveVector) { this.key = key; this.moveVector = moveVector; }
             @Override
             public void actionPerformed(ActionEvent e) {
+                String logPrefix = "LOG (UI-EVENT-KEY): ";
+                System.out.println(logPrefix + "Key '" + key + "' pressed.");
+
                 camera.setOrigin(camera.getOrigin().add(moveVector));
 
-                // FIX: Reset accumulation on *every* key press
-                camera.resetAccumulation();
+                // This is an "event". It resets accumulation.
+                camera.resetAccumulation(); // 1. Reset the counter
+                System.out.println(logPrefix + "camera.resetAccumulation() called. frameCount is now 0.");
 
+                // 2. Send the *current* sky state along with the reset
+                boolean isSkyEnabled = enableSkyCheckBox.isSelected();
+                vulkanEngine.submitSkyToggle(isSkyEnabled);
+
+                // 3. Send the reset (frameCount=0)
                 vulkanEngine.submitCameraUpdate(camera);
+                System.out.println(logPrefix + "submitSkyToggle(" + isSkyEnabled + ") and submitCameraUpdate(fc=0) called.");
             }
         }
 
         // WASD
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_W, 0), "moveForward");
-        actionMap.put("moveForward", new CameraAction(new Vec3(0, 0, -6.5)));
+        actionMap.put("moveForward", new CameraAction("W", new Vec3(0, 0, -6.5)));
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_S, 0), "moveBackward");
-        actionMap.put("moveBackward", new CameraAction(new Vec3(0, 0, 15.0)));
+        actionMap.put("moveBackward", new CameraAction("S", new Vec3(0, 0, 15.0)));
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_A, 0), "moveLeft");
-        actionMap.put("moveLeft", new CameraAction(new Vec3(-5.5, 0, 0)));
+        actionMap.put("moveLeft", new CameraAction("A", new Vec3(-5.5, 0, 0)));
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_D, 0), "moveRight");
-        actionMap.put("moveRight", new CameraAction(new Vec3(5.5, 0, 0)));
+        actionMap.put("moveRight", new CameraAction("D", new Vec3(5.5, 0, 0)));
 
         // Q/E (Up/Down)
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Q, 0), "moveUp");
-        actionMap.put("moveUp", new CameraAction(new Vec3(0, 3.5, 0)));
+        actionMap.put("moveUp", new CameraAction("Q", new Vec3(0, 3.5, 0)));
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_E, 0), "moveDown");
-        actionMap.put("moveDown", new CameraAction(new Vec3(0, -3.5, 0)));
+        actionMap.put("moveDown", new CameraAction("E", new Vec3(0, -3.5, 0)));
     }
 
 
