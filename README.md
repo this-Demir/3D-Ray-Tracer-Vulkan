@@ -1,121 +1,104 @@
-# Vulkan BVH Ray Tracer
+# Gpu Based 3D Ray Tracer 
 
-This project is a high-performance, real-time ray tracer written in Java using Vulkan (via LWJGL) and a Java Swing UI. It uses a Bounding Volume Hierarchy (BVH) built on the CPU to achieve dynamic `O(log n)` rendering performance on the GPU.
+![Java](https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)
+![Vulkan](https://img.shields.io/badge/Vulkan-%23AC162C.svg?style=for-the-badge&logo=vulkan&logoColor=white)
 
-## Current Status (Live Viewer)
+**Author:** Demir Demirdöğen
 
-The project has evolved from a "headless" renderer into a "smart," multi-threaded, real-time viewer with a stable Swing (`JFrame`) UI.
+> **Work in Progress:** This project is actively under development. Features, render techniques, and UI elements are subject to change as new capabilities (like Path Tracing) are implemented.
 
-* **High Performance:** Renders complex models (e.g., 49,000+ triangles) at 60+ FPS using an `O(log n)` BVH acceleration structure.
-* **Dynamic Camera:** Features a fully dynamic camera controlled by the keyboard (WASD), sending updates to the shader via a Uniform Buffer Object (UBO).
-* **Stable Multi-Threaded Architecture:** The application is split into three decoupled threads for maximum performance and UI responsiveness:
-    1.  **UI Thread (Swing EDT):** Manages the `JFrame` and user input. It never freezes.
-    2.  **VRT (Vulkan Engine Thread):** A dedicated thread running the `VulkanEngine` class, which manages all Vulkan calls and the render loop.
-    3.  **SRT (Scene Rebuild Thread):** A background thread (`CompletableFuture`) that runs the `SceneBuilder` to perform CPU-heavy tasks (like BVH construction) without blocking the UI.
+A high-performance, real-time **GPU Ray Tracer** written in Java using **LWJGL** and **Vulkan**.
 
-## Future Plan: Interactive Scene Editor
+This project, developed as a **Software Engineering Student Project**, demonstrates a robust, multi-threaded architecture capable of rendering complex 3D scenes. It utilizes a custom CPU-built **Bounding Volume Hierarchy (BVH)** to achieve O(log n) ray intersection on the GPU, allowing for real-time performance even on integrated graphics.
 
-The next goal is to evolve this viewer into a fully interactive scene editor, similar to the `raytracer-java` project, by implementing a path tracing shader and a scene management system.
+![Ray Tracer Demo](./render-steps-img/car-render-ss.png)
+##  Key Features
 
-### Current Development Roadmap
+* **Real-Time GPU Rendering:** Uses Vulkan Compute Shaders (`.comp`) for massive parallel ray tracing.
+* **BVH Acceleration:** Implements a Linear BVH structure built on the CPU and flattened for GPU traversal, allowing rendering of meshes with 50k+ triangles efficiently.
+* **Multi-Threaded Architecture:**
+    * **UI Thread:** Responsive Swing Interface (never freezes).
+    * **Vulkan Render Thread (VRT):** Dedicated rendering loop managing command queues.
+    * **Scene Rebuild Thread (SRT):** Asynchronous BVH construction for non-blocking scene editing.
+* **Interactive Editor:**
+    * Add/Remove `.obj` models dynamically.
+    * Modify object **Position**, **Scale**, and **Color** in real-time.
+    * Change Material properties (**Matte**, **Metal**, **Emissive**).
+* **Dynamic Camera:** Smooth WASD controls with Uniform Buffer Object (UBO) updates.
 
-1.  **Phase 1: Scene Graph System (CPU)**
-    * Create a `Scene.java` class to manage a dynamic list of objects (`Meshes`, `Spheres`, etc.) instead of a single static model.
-    * Update `SceneBuilder.java` to consume this `Scene` object and build a single, unified BVH for all objects.
-    * Implement Swing UI controls to add/remove objects and trigger a scene rebuild (`rebuildSceneAsync`).
+##  System & Performance
 
-2.  **Phase 2: Path Tracing Shader (GPU)**
-    * Rewrite the `compute_dynamic.comp` shader to be a full, multi-bounce path tracer (porting logic from `raytracer-java`'s `PathTracer.java`).
-    * Implement a Random Number Generator (RNG) inside the shader.
-    * Implement a sky gradient background when a ray hits nothing.
+This engine is highly optimized to run efficiently without requiring high-end dedicated hardware.
 
-3.  **Phase 3: Material System (CPU + GPU)**
-    * Expand the `Material` struct on the GPU and CPU to support different types (Lambertian, Metal, Dielectric).
-    * Implement `scatter` logic in the shader to handle realistic reflections and refractions (mirrors, glass).
+**Tested System Specs:**
+* **OS:** Windows 11 Home Single Language 64-bit
+* **CPU:** 13th Gen Intel(R) Core(TM) i9-13900H
+* **GPU:** Intel(R) Iris(R) Xe Graphics (Integrated)
+* **RAM:** 16GB
 
-4.  **Phase 4: Emissive Lighting (CPU + GPU)**
-    * Add an `Emissive` material type.
-    * Update the shader so that rays hitting an emissive object stop bouncing and return light, turning those objects into light sources.
-    * Add UI controls to add/move light sources (which are just objects with an emissive material) and rebuild the scene. 
+> **Performance Note:** Despite running on an integrated GPU (no external graphics card), the application maintains a stable **~40 FPS** in complex scenes. This demonstrates the efficiency of the BVH acceleration structure and memory management.
 
+##  Architecture Overview
 
+The application is built on a "Decoupled Rendering" model to ensure the UI remains responsive even during heavy computation like BVH construction.
 
-## Old Status (Headless Engine)
+```mermaid
+graph TD
+    User[User Input] --> UI[Swing UI Thread]
+    UI -- "Camera Updates" --> Q1[Camera Queue]
+    UI -- "Scene Changes" --> SRT[Scene Rebuild Thread]
+    SRT -- "Built BVH & Buffers" --> Q2[Scene Queue]
+    
+    subgraph VRT [Vulkan Render Thread]
+        Loop[Render Loop]
+        Q1 --> Loop
+        Q2 --> Loop
+        Loop --> GPU[Vulkan Compute Shader]
+    end
+    
+    GPU -- "Rendered Frame" --> UI
+```
 
-The project is currently a "headless" single-shot renderer (`VulkanApp.java`). In its present state, it successfully:
+##  Controls
 
-1.  Loads a 3D model (`.obj`) from disk.
-2.  Builds a Bounding Volume Hierarchy (BVH) on the CPU, a one-time O(n log n) task.
-3.  "Flattens" the BVH tree and uploads all scene geometry, materials, and the BVH structure to GPU-exclusive memory.
-4.  Executes a Vulkan compute shader (`compute.comp`) that traces rays against the BVH, achieving O(log n) average-case complexity per ray.
-5.  Waits for the GPU to finish, copies the resulting image back from VRAM, and saves it to a PNG file before exiting.
+### Camera Movement
+* **W / S:** Move Forward / Backward
+* **A / D:** Move Left / Right
+* **Q / E:** Move Up / Down
 
-##  OLD Future Plan: Dynamic JavaFX Editor : DONE
+### UI Panel
+* **Object List:** Select objects to modify properties.
+* **Add Model:** Import standard `.obj` files from disk.
+* **Global Settings:** Toggle Sky Light, Adjust Exposure.
+* **Material Editor:** Switch between Lambertian, Metallic, or Emissive materials.
 
-The next goal is to transform this powerful headless engine into a fully dynamic, real-time scene editor with a JavaFX UI.
+##  Technical Details
 
-To achieve a smooth, 60 FPS user experience, the application **must never block the JavaFX Application Thread (FXAT)**. This requires a multi-threaded architecture that separates UI logic, rendering, and scene construction.
+* **Language:** Java 17+
+* **Graphics API:** Vulkan 1.2+ (via LWJGL 3)
+* **Shading Language:** GLSL 4.50
+* **Acceleration Structure:** Linear Bounding Volume Hierarchy (LBVH) built on CPU.
+* **Synchronization:** Explicit memory barriers and layout transitions (General <-> Transfer) to manage resource synchronization between Compute and Transfer queues.
 
-This architecture will be built on three distinct thread types:
+##  Build & Run
 
-### 1. The FXAT (JavaFX Application Thread)
+### Prerequisites
+* **Java:** JDK 17 or higher.
+* **Vulkan:** A Vulkan-capable GPU and the **Vulkan Runtime/SDK** installed on your system.
+* **Build Tool:** Maven or Gradle (depending on project setup).
 
-* **Role:** Manages the JavaFX UI, including the `AnimationTimer`, all buttons, sliders, and keyboard/mouse input.
-* **Policy:** This thread **never** performs heavy work. In its 60 FPS `AnimationTimer` loop, it only does two things:
-    1.  Grabs the *latest completed frame* from a thread-safe queue.
-    2.  Displays that frame in a JavaFX `ImageView`.
-* When a user moves the camera or adds an object, the FXAT simply sends a non-blocking message to the `RenderService` (our "CPU Manager") and continues its loop.
+### Running
+1.  Clone the repository.
+2.  Ensure shader binaries (`.spv`) are compiled in `shaders_spv/`.
+3.  Run the main class:
+    ```bash
+    # Run via IDE or Jar
+    java -jar target/ray-tracer-vulkan.jar
+    ```
 
-### 2. The VRT (Vulkan Render Thread)
+## 📄 Development Log
 
-* **Role:** This is a dedicated, long-running `Thread` that runs the `RenderLoop`.
-* **Policy:** This is the **only thread in the entire application allowed to make Vulkan API calls** (`vkQueueSubmit`, `vkWaitForFences`, `vkCreateBuffer`, etc.).
-    * It runs in a continuous loop, producing frames as fast as the GPU will allow.
-    * After rendering a frame, it copies the image from VRAM to a `ByteBuffer` in RAM.
-    * It places this `ByteBuffer` into a thread-safe `AtomicReference` for the FXAT to pick up.
-    * It also polls its own thread-safe queues for new camera data or new scene data to upload.
+For a detailed history of the project's evolution, technical hurdles, and future roadmap (Path Tracing implementation), please see the [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
-### 3. The SRT (Scene Rebuild Thread)
-
-* **Role:** A *temporary* background thread (e.g., a `CompletableFuture`) that is launched only when the scene is modified (e.g., "Add Sphere" is clicked).
-* **Policy:** This thread performs the slow, **CPU-only** O(n log n) tasks:
-    1.  Runs the `BVHBuilder.build()` algorithm.
-    2.  Runs the `BVHFlattener.flatten()` algorithm.
-    3.  Prepares all scene data (vertices, materials, BVH) in CPU-side `ByteBuffer`s and `FloatBuffer`s.
-* It **does not** make any Vulkan calls. When finished, it hands its prepared CPU buffers to the `RenderService`, which safely queues them for the **VRT** to upload.
-
-### Thread-Safe Data Flow (The "CPU Manager" Model)
-
-This entire process is managed by a central `RenderService` class to ensure thread safety.
-
-1.  **Camera Move (Fast Path):**
-    * `FXAT` (Key press) -> `RenderService.updateCamera()`
-    * `RenderService` -> `VRT.cameraQueue.add(newCam)`
-    * `VRT` (next loop) -> `renderer.updateCameraUBO(newCam)`
-
-2.  **Scene Edit (Slow Path):**
-    * `FXAT` (Button click) -> `RenderService.rebuildScene()`
-    * `RenderService` -> Launches `SRT` with a snapshot of the scene.
-    * *(...FXAT and VRT continue running, rendering the OLD scene...)*
-    * `SRT` (finishes) -> `RenderService.onSceneBuilt(cpuData)`
-    * `RenderService` -> `VRT.sceneSwapQueue.add(cpuData)`
-    * `VRT` (next loop) -> `vkDeviceWaitIdle()`, destroys old GPU buffers, uploads new `cpuData`, and proceeds.
-    * *(The VRT now renders the NEW scene. The UI never froze.)*
-
-## Development Roadmap
-
-1.  **Phase 1: Refactor Engine**
-    * Convert `VulkanApp.java` into a reusable `VulkanRenderer.java` class with `init()`, `renderFrame(): ByteBuffer`, and `destroy()` methods.
-2.  **Phase 2: JavaFX Wrapper**
-    * Create the `MainApp` (JavaFX) and `RenderLoop` (VRT).
-    * Get the `ByteBuffer` from the `VRT` and display it in a JavaFX `ImageView` using an `AnimationTimer` on the `FXAT`.
-3.  **Phase 3: The "CPU Manager"**
-    * Create the `RenderService` to manage the threads.
-    * Create `SceneBuilder.java` to house the `BVHBuilder` and `BVHFlattener` logic.
-    * Implement the full, thread-safe "Scene Edit" data flow.
-4.  **Phase 4: Features**
-    * Implement a Vulkan Uniform Buffer Object (UBO) for a dynamic camera.
-    * Build the UI controls (sliders, buttons) to add objects and modify materials.
-    * Add debug features (e.g., "show ray" on mouse click).
-
+*Powered by LWJGL and Vulkan.*
 
