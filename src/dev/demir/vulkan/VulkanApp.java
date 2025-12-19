@@ -310,7 +310,7 @@ public class VulkanApp {
         System.out.println("LOG (UI-POPULATE): Populating default scene...");
 
         // --- GROUND (Matte) ---
-        ModelInstance plane = new ModelInstance("ground_plane.obj", "Ground Plane");
+        ModelInstance plane = new ModelInstance("./objects/ground_plane.obj", "Ground Plane");
         plane.setPosition(new Vec3(0, -10, 0));
         plane.setScale(new Vec3(150, 1, 150)); // Non-uniform scale
         plane.setColor(new Vec3(0.5, 0.5, 0.5)); // "Grey" preset
@@ -319,7 +319,7 @@ public class VulkanApp {
         listModel.addElement(plane);
 
         // --- CAR (Metal) ---
-        ModelInstance car = new ModelInstance("car.obj", "Car");
+        ModelInstance car = new ModelInstance("./objects/car.obj", "Car");
         car.setPosition(new Vec3(0, -8, 0));
         car.setScale(new Vec3(2, 2, 2));
         car.setColor(new Vec3(0.6, 0.7, 0.1));
@@ -327,14 +327,16 @@ public class VulkanApp {
         scene.addInstance(car);
         listModel.addElement(car);
 
+        /*
         // --- LIGHT SOURCE (Emissive) ---
-        ModelInstance light = new ModelInstance("sun.obj", "Light Source");
+        ModelInstance light = new ModelInstance("./objects/sun.obj", "Light Source");
         light.setPosition(new Vec3(0, 220, 0));
         light.setScale(new Vec3(0.35, 0.35, 0.35));
         light.setColor(new Vec3(4.0, 4.0, 4.0)); // Bright white ( > 1.0)
         light.setMaterialType(3.0f); // 3.0f = Emissive
         scene.addInstance(light);
         listModel.addElement(light);
+         */
 
 
         sceneObjectList.setSelectedValue(car, true); // Select the car by default
