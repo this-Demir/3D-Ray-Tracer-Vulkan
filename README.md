@@ -11,7 +11,10 @@ A high-performance, real-time **GPU Ray Tracer** written in Java using **LWJGL**
 
 This project, developed as a **Software Engineering Student Project**, demonstrates a robust, multi-threaded architecture capable of rendering complex 3D scenes. It utilizes a custom CPU-built **Bounding Volume Hierarchy (BVH)** to achieve O(log n) ray intersection on the GPU, allowing for real-time performance even on integrated graphics.
 
-![Ray Tracer Demo](./render-steps-img/car-render-ss.png)
+### [➔Click here to visit the Render Gallery ](GALLERY.md)
+
+
+![Ray Tracer Demo](render_images/car-render-ss.png)
 ##  Key Features
 
 * **Real-Time GPU Rendering:** Uses Vulkan Compute Shaders (`.comp`) for massive parallel ray tracing.
@@ -96,7 +99,7 @@ graph TD
     java -jar target/ray-tracer-vulkan.jar
     ```
 
-## 📄 Development Log
+##  Development Log
 
 For a detailed history of the project's evolution, technical hurdles, and future roadmap (Path Tracing implementation), please see the [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
