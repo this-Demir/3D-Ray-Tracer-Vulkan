@@ -57,6 +57,16 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 | ~49k triangles | 29 ms | 0.6 ms |
 | ~1M triangles (20 instanced meshes) | 1129 ms | 0.7 ms |
 
+**GPU time per frame of the built-in scenes** (1 sample per pixel; frames accumulate until the sample limit):
+
+| Scene | GPU time | Notes |
+|---|---|---|
+| Custom | 0.5 ms | ~49k triangles, sky light |
+| Mirror Room | 2.4 ms | up to 30 bounces between mirrors |
+| Eclipse (animated) | 0.4 ms | TLAS rebuilt every frame |
+| ShowRoom (animated) | 0.5 ms | ~205k triangles |
+| Black Hole | 14 ms | every camera ray integrated around the black hole (~70 frames per second) |
+
 Building the acceleration structures for the default scene takes about 17 ms on the GPU (the CPU BVH took 0.4 s). With two frames in flight the renderer produces about 2000 frames per second on the default scene; the window shows the newest one at the monitor's refresh rate, and the extra frames go into accumulation. The window title shows render FPS, GPU time per frame (from timestamp queries), display FPS and accumulated samples.
 
 ##  Architecture Overview
@@ -101,6 +111,8 @@ graph TD
 * **Acceleration Structures:** One BLAS per mesh (vertex and index buffers in VRAM, read in the shader through buffer device addresses) or per sphere (one AABB), one TLAS over all instances, all built on the GPU by the driver. For animated scenes the TLAS is rebuilt in every frame's command buffer from that frame's instance buffer.
 * **Frame Pipeline:** Two frames in flight; the shader writes BGRA so the frame copied back from cached host memory goes straight into a `TYPE_INT_RGB` image; GPU time is measured with timestamp queries. Animation time advances in 1/60 s steps, so frames rendered within one step still accumulate.
 * **Synchronization:** Explicit memory barriers and layout transitions (General <-> Transfer) between the compute pass and the copy of the frame to the CPU.
+* **Black Hole:** camera rays are integrated along exact Schwarzschild light paths (RK4, one ray query per step) with a relativistic accretion disk; derivations and measurements in [docs/black-hole.md](docs/black-hole.md).
+* **Tests:** JUnit 5 tests check the black hole integrator (a CPU copy of the shader math) against exact results: the light path against the exact orbit integral, the photon sphere, the capture threshold, the shadow size and the weak-field deflection.
 
 ##  Build & Run
 
@@ -117,13 +129,15 @@ graph TD
 Shaders live in `src/main/shaders/` and are compiled to SPIR-V during the build (Gradle task `compileShaders`, using shaderc through LWJGL), so no Vulkan SDK or `glslc` is needed. The default scene uses models from `objects/`.
 To turn on Vulkan validation (requires the Vulkan SDK), run `./gradlew run -Dvulkan.validation=true`.
 
+To run the tests: `./gradlew test`.
+
 To get a standalone build: `./gradlew installDist`, then start `build/install/ray-tracer-vulkan/bin/ray-tracer-vulkan` from the repository root (shaders and models are loaded relative to the working directory).
 
 In IntelliJ IDEA, open the folder and let it import the Gradle project.
 
 ##  Development Log
 
-For a detailed history of the project's evolution, technical hurdles, and future roadmap (Path Tracing implementation), please see the [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
+For a detailed history of the project's evolution, technical hurdles, and what comes next, please see the [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
 *Powered by LWJGL and Vulkan.*
 
