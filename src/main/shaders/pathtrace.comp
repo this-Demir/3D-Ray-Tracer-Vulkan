@@ -6,16 +6,22 @@
 /*
  * Path tracer using hardware ray tracing (RT cores) through ray queries.
  * The scene is a top-level acceleration structure (TLAS) over instances; each instance
- * points at a mesh BLAS. Per-instance data (mesh buffers, material) lives in InstanceBuffer.
+ * points at a BLAS: a triangle mesh, or a single AABB for an analytic unit sphere.
+ * Per-instance data (mesh buffers, material) lives in InstanceBuffer.
  */
 
 // --- Data layout (must match RayTracingScene.java / VulkanEngine.java) ---
 struct Ray { vec3 origin; vec3 dir; };
 
-struct InstanceInfo {
-    uint64_t vertexAddress;   // float x, y, z per vertex (object space)
-    uint64_t indexAddress;    // uint, three per triangle
-    vec4     albedoAndType;   // rgb = albedo, a = material type
+struct InstanceInfo {             // 64 bytes, written by RayTracingScene.writeInstanceInfo
+    uint64_t vertexAddress;       // triangles: float x, y, z per vertex (object space)
+    uint64_t indexAddress;        // triangles: uint, three per triangle
+    vec4     albedoRoughness;     // rgb = albedo, a = roughness (metal)
+    vec4     emissionIor;         // rgb = emitted radiance, a = index of refraction (glass)
+    uint     materialType;        // MAT_*
+    uint     geometryType;        // GEOMETRY_*
+    uint     pad0;
+    uint     pad1;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Positions { float v[]; };
@@ -40,12 +46,15 @@ layout(std140, set = 0, binding = 3) uniform FrameUBO {
 
 // --- Constants ---
 const float T_MIN = 0.001;
-const float T_MAX = 10000.0;
-const int   MAX_BOUNCES = 10;
-const float MAT_LAMBERTIAN  = 0.0;
-const float MAT_METAL       = 1.0;
-const float MAT_METAL_FUZZY = 2.0;
-const float MAT_EMISSIVE    = 3.0;
+const float T_MAX = 1.0e6;
+const float PI = 3.14159265359;
+// Must match Material.Type ordinals and RayTracingScene.GEOMETRY_*
+const uint MAT_DIFFUSE  = 0u;
+const uint MAT_METAL    = 1u;
+const uint MAT_GLASS    = 2u;
+const uint MAT_EMISSIVE = 3u;
+const uint GEOMETRY_TRIANGLES = 0u;
+const uint GEOMETRY_SPHERE    = 1u;
 
 // --- Random numbers (PCG hash) ---
 uint seed;
@@ -58,137 +67,191 @@ uint pcg(uint v) {
 
 float randomFloat() {
     seed = pcg(seed);
-    return float(seed) / float(0xFFFFFFFFu);
-}
-
-vec3 randomVec3InUnitSphere() {
-    for (;;) {
-        vec3 p = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
-        if (dot(p, p) < 1.0) return p;
-    }
+    return float(seed) / 4294967296.0; // [0, 1)
 }
 
 vec3 randomUnitVector() {
-    return normalize(randomVec3InUnitSphere());
+    float z = 1.0 - 2.0 * randomFloat();
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    float phi = 2.0 * PI * randomFloat();
+    return vec3(r * cos(phi), r * sin(phi), z);
 }
 
-vec3 getSkyColor(Ray r) {
-    vec3 unit_direction = normalize(r.dir);
-    float t = 0.5 * (unit_direction.y + 1.0);
+vec3 getSkyColor(vec3 dir) {
+    if (frame.skyEnabled == 0u) return vec3(0.0);
+    float t = 0.5 * (normalize(dir).y + 1.0);
     return (1.0 - t) * vec3(1.0) + t * vec3(0.5, 0.7, 1.0);
 }
 
-// --- Hit information from the committed ray-query intersection ---
+// --- Ray queries ---
+
+// Nearest t in (tMin, tMax) where the object-space ray o + t*d hits the unit sphere, or -1.
+// d is not normalized: the instance transform may scale it, but t stays the world-space t.
+float intersectUnitSphere(vec3 o, vec3 d, float tMin, float tMax) {
+    float a = dot(d, d);
+    float halfB = dot(o, d);
+    float c = dot(o, o) - 1.0;
+    float discriminant = halfB * halfB - a * c;
+    if (discriminant < 0.0) return -1.0;
+    float root = sqrt(discriminant);
+    float t = (-halfB - root) / a;
+    if (t <= tMin || t >= tMax) {
+        t = (-halfB + root) / a;      // ray starts inside the sphere (glass): far side
+        if (t <= tMin || t >= tMax) return -1.0;
+    }
+    return t;
+}
+
+// Runs a ray query to completion. Triangles are opaque and committed by the hardware;
+// sphere AABB candidates are intersected here and committed with GenerateIntersection.
+// (A macro, because GLSL does not allow ray query objects as inout function parameters.)
+#define RUN_QUERY(query, rayTMax)                                                                       \
+    while (rayQueryProceedEXT(query)) {                                                                 \
+        if (rayQueryGetIntersectionTypeEXT(query, false) == gl_RayQueryCandidateIntersectionAABBEXT) {  \
+            float tMaxNow = rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT \
+                    ? (rayTMax) : rayQueryGetIntersectionTEXT(query, true);                             \
+            float tSphere = intersectUnitSphere(rayQueryGetIntersectionObjectRayOriginEXT(query, false), \
+                                                rayQueryGetIntersectionObjectRayDirectionEXT(query, false), \
+                                                rayQueryGetRayTMinEXT(query), tMaxNow);                 \
+            if (tSphere > 0.0) {                                                                        \
+                rayQueryGenerateIntersectionEXT(query, tSphere);                                        \
+            }                                                                                           \
+        }                                                                                               \
+    }
+
+// --- Hit information from the committed intersection ---
 struct Hit {
     float t;
-    vec3  normal;    // world space, facing against the ray
-    vec4  material;  // rgb = albedo, a = type
+    vec3  normal;      // world space, facing against the ray
+    bool  frontFace;   // ray hit the outside of the surface
+    uint  instance;    // index into instances[]
 };
 
-bool traceRay(Ray r, out Hit hit) {
+bool traceRay(Ray r, float tMax, out Hit hit) {
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, r.origin, T_MIN, r.dir, T_MAX);
-    while (rayQueryProceedEXT(query)) {
-        // All geometry is opaque, so the hardware commits the closest triangle by itself.
-    }
-    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+    rayQueryInitializeEXT(query, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, r.origin, T_MIN, r.dir, tMax);
+    RUN_QUERY(query, tMax);
+
+    uint committed = rayQueryGetIntersectionTypeEXT(query, true);
+    if (committed == gl_RayQueryCommittedIntersectionNoneEXT) {
         return false;
     }
 
-    InstanceInfo instance = instances[rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)];
-    int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    uint instanceIndex = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
+    float t = rayQueryGetIntersectionTEXT(query, true);
+    vec3 objectNormal;
+    if (committed == gl_RayQueryCommittedIntersectionGeneratedEXT) {
+        // Unit sphere: the normal is the object-space hit point.
+        objectNormal = rayQueryGetIntersectionObjectRayOriginEXT(query, true)
+                     + t * rayQueryGetIntersectionObjectRayDirectionEXT(query, true);
+    } else {
+        InstanceInfo instance = instances[instanceIndex];
+        int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        Indices indices = Indices(instance.indexAddress);
+        Positions positions = Positions(instance.vertexAddress);
+        uint i0 = indices.i[3 * primitive];
+        uint i1 = indices.i[3 * primitive + 1];
+        uint i2 = indices.i[3 * primitive + 2];
+        vec3 v0 = vec3(positions.v[3 * i0], positions.v[3 * i0 + 1], positions.v[3 * i0 + 2]);
+        vec3 v1 = vec3(positions.v[3 * i1], positions.v[3 * i1 + 1], positions.v[3 * i1 + 2]);
+        vec3 v2 = vec3(positions.v[3 * i2], positions.v[3 * i2 + 1], positions.v[3 * i2 + 2]);
+        objectNormal = cross(v1 - v0, v2 - v0);
+    }
 
-    Indices indices = Indices(instance.indexAddress);
-    Positions positions = Positions(instance.vertexAddress);
-    uint i0 = indices.i[3 * primitive];
-    uint i1 = indices.i[3 * primitive + 1];
-    uint i2 = indices.i[3 * primitive + 2];
-    vec3 v0 = vec3(positions.v[3 * i0], positions.v[3 * i0 + 1], positions.v[3 * i0 + 2]);
-    vec3 v1 = vec3(positions.v[3 * i1], positions.v[3 * i1 + 1], positions.v[3 * i1 + 2]);
-    vec3 v2 = vec3(positions.v[3 * i2], positions.v[3 * i2 + 1], positions.v[3 * i2 + 2]);
-
-    // Object-space face normal to world space: n_world = transpose(inverse(M)) * n = n * WorldToObject.
-    vec3 objectNormal = cross(v1 - v0, v2 - v0);
+    // Object-space normal to world space: n_world = transpose(inverse(M)) * n = n * WorldToObject.
     mat4x3 worldToObject = rayQueryGetIntersectionWorldToObjectEXT(query, true);
     vec3 normal = normalize((objectNormal * worldToObject).xyz);
-    if (dot(r.dir, normal) > 0.0) normal = -normal;
-
-    hit.t = rayQueryGetIntersectionTEXT(query, true);
-    hit.normal = normal;
-    hit.material = instance.albedoAndType;
+    hit.frontFace = dot(r.dir, normal) < 0.0;
+    hit.normal = hit.frontFace ? normal : -normal;
+    hit.t = t;
+    hit.instance = instanceIndex;
     return true;
 }
 
 // --- Materials ---
-bool scatter(Ray r_in, vec4 material, vec3 hit_pos, vec3 hit_normal,
-             out vec3 attenuation, out Ray scattered) {
-    vec3 albedo = material.rgb;
-    float type = material.a;
 
-    if (type == MAT_LAMBERTIAN) {
-        vec3 scatter_direction = hit_normal + randomUnitVector();
-        if (length(scatter_direction) < 0.0001) scatter_direction = hit_normal;
-        scattered   = Ray(hit_pos, normalize(scatter_direction));
-        attenuation = albedo;
+float schlick(float cosine, float ior) {
+    float r0 = (1.0 - ior) / (1.0 + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+}
+
+// Picks the next direction. Returns false if the path is absorbed.
+bool scatter(vec3 inDir, Hit hit, InstanceInfo material, out vec3 attenuation, out vec3 outDir) {
+    vec3 albedo = material.albedoRoughness.rgb;
+    attenuation = albedo;
+
+    if (material.materialType == MAT_DIFFUSE) {
+        outDir = hit.normal + randomUnitVector(); // cosine-weighted around the normal
+        if (dot(outDir, outDir) < 1e-8) outDir = hit.normal;
+        outDir = normalize(outDir);
         return true;
     }
-
-    if (type == MAT_METAL || type == MAT_METAL_FUZZY) {
-        float fuzz     = (type == MAT_METAL_FUZZY) ? 0.3 : 0.0;
-        vec3 reflected = reflect(normalize(r_in.dir), hit_normal);
-        scattered      = Ray(hit_pos, normalize(reflected + fuzz * randomVec3InUnitSphere()));
-        attenuation    = albedo;
-        return (dot(scattered.dir, hit_normal) > 0.0);
+    if (material.materialType == MAT_METAL) {
+        float roughness = material.albedoRoughness.a;
+        outDir = normalize(reflect(inDir, hit.normal) + roughness * randomUnitVector());
+        return dot(outDir, hit.normal) > 0.0;
     }
-
-    return false; // emissive and unknown materials do not scatter
+    if (material.materialType == MAT_GLASS) {
+        float ior = material.emissionIor.a;
+        float ratio = hit.frontFace ? 1.0 / ior : ior;
+        float cosTheta = min(dot(-inDir, hit.normal), 1.0);
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        bool cannotRefract = ratio * sinTheta > 1.0;
+        if (cannotRefract || schlick(cosTheta, ratio) > randomFloat()) {
+            outDir = reflect(inDir, hit.normal);
+        } else {
+            outDir = refract(inDir, hit.normal, ratio);
+        }
+        return true;
+    }
+    return false; // emissive surfaces do not scatter
 }
 
 // --- Main ---
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
-    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 image_size   = imageSize(resultImage);
-    if (pixel_coords.x >= image_size.x || pixel_coords.y >= image_size.y) return;
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(resultImage);
+    if (pixel.x >= imageSize.x || pixel.y >= imageSize.y) return;
 
-    seed = uint(pixel_coords.y * image_size.x + pixel_coords.x);
+    seed = uint(pixel.y * imageSize.x + pixel.x);
 
     // Anti-aliasing jitter, with the image flipped vertically
-    float u = (float(pixel_coords.x) + randomFloat()) / float(image_size.x);
-    float v = (float(image_size.y - 1 - pixel_coords.y) + randomFloat()) / float(image_size.y);
+    float u = (float(pixel.x) + randomFloat()) / float(imageSize.x);
+    float v = (float(imageSize.y - 1 - pixel.y) + randomFloat()) / float(imageSize.y);
 
     Ray r;
     r.origin = frame.origin.xyz;
     r.dir = normalize(frame.lowerLeft.xyz + frame.horizontal.xyz * u + frame.vertical.xyz * v - frame.origin.xyz);
 
-    vec3 final_color = vec3(0.0);
-    vec3 attenuation = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
 
-    for (int b = 0; b < MAX_BOUNCES; b++) {
+    for (uint bounce = 0u; bounce < frame.maxBounces; bounce++) {
         Hit hit;
-        if (!traceRay(r, hit)) {
-            final_color = attenuation * getSkyColor(r);
+        if (!traceRay(r, T_MAX, hit)) {
+            radiance += throughput * getSkyColor(r.dir);
+            break;
+        }
+        InstanceInfo material = instances[hit.instance];
+        if (material.materialType == MAT_EMISSIVE) {
+            radiance += throughput * material.emissionIor.rgb;
             break;
         }
 
-        if (hit.material.a == MAT_EMISSIVE) {
-            final_color = attenuation * hit.material.rgb;
+        vec3 attenuation;
+        vec3 nextDir;
+        if (!scatter(r.dir, hit, material, attenuation, nextDir)) {
             break;
         }
-
-        vec3 hit_pos = r.origin + r.dir * hit.t;
-        vec3 mat_attenuation;
-        Ray scattered;
-        if (!scatter(r, hit.material, hit_pos, hit.normal, mat_attenuation, scattered)) {
-            break; // absorbed: final_color stays black
-        }
-        attenuation *= mat_attenuation;
-        r = scattered;
-        // A path still bouncing after MAX_BOUNCES contributes nothing (final_color stays black).
+        throughput *= attenuation;
+        r.origin = r.origin + r.dir * hit.t;
+        r.dir = nextDir;
     }
 
-    // Gamma ~2 (sqrt). Stored as B, G, R, A so that the bytes read back on the CPU are, as a
-    // little-endian int, 0xAARRGGBB: exactly the layout of a Java TYPE_INT_RGB image.
-    vec3 display = sqrt(final_color);
-    imageStore(resultImage, pixel_coords, vec4(display.b, display.g, display.r, 1.0));
+    // Exposure, then gamma ~2 (sqrt). Stored as B, G, R, A so that the bytes read back on the
+    // CPU are, as a little-endian int, 0xAARRGGBB: exactly the layout of a Java TYPE_INT_RGB image.
+    vec3 display = sqrt(clamp(radiance * exp2(frame.exposure), 0.0, 1.0));
+    imageStore(resultImage, pixel, vec4(display.b, display.g, display.r, 1.0));
 }

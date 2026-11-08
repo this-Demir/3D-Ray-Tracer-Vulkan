@@ -1,7 +1,10 @@
 package dev.demir.vulkan.engine;
 
+import dev.demir.vulkan.scene.Geometry;
+import dev.demir.vulkan.scene.Material;
 import dev.demir.vulkan.scene.MeshData;
 import dev.demir.vulkan.scene.SceneDescription;
+import dev.demir.vulkan.scene.SphereGeometry;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
@@ -23,19 +26,24 @@ import static org.lwjgl.vulkan.VK10.*;
 /**
  * GPU side of the scene for hardware ray tracing.
  *
- * - One bottom-level acceleration structure (BLAS) per distinct mesh, built once from
- *   VRAM vertex/index buffers and reused by every instance and every scene edit.
+ * - One bottom-level acceleration structure (BLAS) per distinct geometry, built once and
+ *   reused by every instance and every scene edit: triangle meshes from VRAM vertex/index
+ *   buffers, analytic spheres as a single AABB that the shader intersects exactly.
  * - One top-level acceleration structure (TLAS) over all instances, rebuilt on each
  *   scene update (cheap: it only holds transforms and BLAS references).
  * - An instance-info buffer the shader indexes with the instance's custom index, holding
- *   the mesh's vertex/index buffer addresses and the instance's material.
+ *   the mesh buffer addresses and the instance's material.
  *
  * Not thread-safe; used only on the Vulkan render thread, while the GPU is idle.
  */
 public final class RayTracingScene {
 
     /** Bytes per entry in the instance-info buffer; must match InstanceInfo in pathtrace.comp. */
-    public static final int INSTANCE_INFO_SIZE = 32;
+    public static final int INSTANCE_INFO_SIZE = 64;
+
+    /** Geometry types; must match GEOMETRY_* in pathtrace.comp. */
+    public static final int GEOMETRY_TRIANGLES = 0;
+    public static final int GEOMETRY_SPHERE = 1;
 
     private static final int GEOMETRY_INPUT_USAGE = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
             | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
@@ -44,14 +52,16 @@ public final class RayTracingScene {
     private record AccelerationStructure(long handle, GpuBuffer storage, long deviceAddress) {
     }
 
-    private record GpuMesh(GpuBuffer vertices, GpuBuffer indices, AccelerationStructure blas, int triangleCount) {
+    /** A geometry on the GPU. Triangle meshes have vertices/indices; spheres have aabbs. */
+    private record GpuGeometry(int type, GpuBuffer vertices, GpuBuffer indices, GpuBuffer aabbs,
+                               AccelerationStructure blas) {
     }
 
     private final VkDevice device;
     private final GpuMemory memory;
     private final long scratchAlignment;
 
-    private final Map<String, GpuMesh> meshes = new HashMap<>();
+    private final Map<String, GpuGeometry> geometries = new HashMap<>();
     private AccelerationStructure tlas;
     private GpuBuffer tlasInstances; // VkAccelerationStructureInstanceKHR[] read by the TLAS build
     private GpuBuffer instanceInfo;  // InstanceInfo[] read by the shader
@@ -71,37 +81,38 @@ public final class RayTracingScene {
     }
 
     /**
-     * Makes the GPU scene match the description: builds BLASes for new meshes, frees
-     * meshes no instance uses any more, and rebuilds the TLAS and instance-info buffer.
+     * Makes the GPU scene match the description: builds BLASes for new geometries, frees
+     * geometries no instance uses any more, and rebuilds the TLAS and instance-info buffer.
      */
     public void update(SceneDescription scene) {
         long start = System.nanoTime();
-        int newMeshes = 0;
+        int newGeometries = 0;
         Set<String> used = new HashSet<>();
         for (SceneDescription.Instance instance : scene.instances()) {
-            MeshData mesh = instance.mesh();
-            used.add(mesh.path());
-            if (!meshes.containsKey(mesh.path())) {
-                meshes.put(mesh.path(), uploadMesh(mesh));
-                newMeshes++;
+            Geometry geometry = instance.geometry();
+            used.add(geometry.key());
+            if (!geometries.containsKey(geometry.key())) {
+                geometries.put(geometry.key(), upload(geometry));
+                newGeometries++;
             }
         }
         long blasDone = System.nanoTime();
 
-        for (Iterator<Map.Entry<String, GpuMesh>> it = meshes.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, GpuMesh> entry = it.next();
+        for (Iterator<Map.Entry<String, GpuGeometry>> it = geometries.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, GpuGeometry> entry = it.next();
             if (!used.contains(entry.getKey())) {
-                destroyMesh(entry.getValue());
+                destroyGeometry(entry.getValue());
                 it.remove();
             }
         }
 
         destroyTopLevel();
         buildTopLevel(scene);
-        System.out.printf("LOG (VRT-RT): Scene updated: %d instance(s), %,d triangles, %d mesh(es) on GPU "
+        System.out.printf("LOG (VRT-RT): Scene updated: %d instance(s), %,d triangles, %d geometr%s on GPU "
                         + "(%d new BLAS in %.1f ms, TLAS in %.1f ms)%n",
-                scene.instances().size(), scene.triangleCount(), meshes.size(),
-                newMeshes, (blasDone - start) / 1e6, (System.nanoTime() - blasDone) / 1e6);
+                scene.instances().size(), scene.triangleCount(), geometries.size(),
+                geometries.size() == 1 ? "y" : "ies",
+                newGeometries, (blasDone - start) / 1e6, (System.nanoTime() - blasDone) / 1e6);
     }
 
     public long topLevelAccelerationStructure() {
@@ -114,17 +125,24 @@ public final class RayTracingScene {
 
     public void destroy() {
         destroyTopLevel();
-        meshes.values().forEach(this::destroyMesh);
-        meshes.clear();
+        geometries.values().forEach(this::destroyGeometry);
+        geometries.clear();
     }
 
-    // --- Meshes / BLAS ---
+    // --- Geometry / BLAS ---
 
-    private GpuMesh uploadMesh(MeshData mesh) {
+    private GpuGeometry upload(Geometry geometry) {
+        return switch (geometry) {
+            case MeshData mesh -> uploadMesh(mesh);
+            case SphereGeometry sphere -> uploadSphere();
+        };
+    }
+
+    private GpuGeometry uploadMesh(MeshData mesh) {
         ByteBuffer vertexBytes = memAlloc(mesh.positions().length * Float.BYTES);
         ByteBuffer indexBytes = memAlloc(mesh.indices().length * Integer.BYTES);
-        GpuBuffer vertices = null;
-        GpuBuffer indices = null;
+        GpuBuffer vertices;
+        GpuBuffer indices;
         try {
             vertexBytes.asFloatBuffer().put(mesh.positions());
             indexBytes.asIntBuffer().put(mesh.indices());
@@ -152,14 +170,42 @@ public final class RayTracingScene {
 
             AccelerationStructure blas = build(stack, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
                     geometry, mesh.triangleCount());
-            return new GpuMesh(vertices, indices, blas, mesh.triangleCount());
+            return new GpuGeometry(GEOMETRY_TRIANGLES, vertices, indices, null, blas);
         }
     }
 
-    private void destroyMesh(GpuMesh mesh) {
-        destroy(mesh.blas());
-        memory.destroy(mesh.vertices());
-        memory.destroy(mesh.indices());
+    /** Unit sphere: one AABB [-1, 1]^3; the shader computes the exact hit inside it. */
+    private GpuGeometry uploadSphere() {
+        ByteBuffer box = memAlloc(VkAabbPositionsKHR.SIZEOF);
+        GpuBuffer aabbs;
+        try {
+            box.putFloat(0, -1f).putFloat(4, -1f).putFloat(8, -1f)
+                    .putFloat(12, 1f).putFloat(16, 1f).putFloat(20, 1f);
+            aabbs = memory.createDeviceLocalBuffer(box, GEOMETRY_INPUT_USAGE);
+        } finally {
+            memFree(box);
+        }
+
+        try (MemoryStack stack = stackPush()) {
+            VkAccelerationStructureGeometryKHR.Buffer geometry = VkAccelerationStructureGeometryKHR.calloc(1, stack);
+            geometry.get(0)
+                    .sType$Default()
+                    .geometryType(VK_GEOMETRY_TYPE_AABBS_KHR)
+                    .flags(VK_GEOMETRY_OPAQUE_BIT_KHR);
+            VkAccelerationStructureGeometryAabbsDataKHR aabbData = geometry.get(0).geometry().aabbs();
+            aabbData.sType$Default().stride(VkAabbPositionsKHR.SIZEOF);
+            aabbData.data().deviceAddress(aabbs.deviceAddress());
+
+            AccelerationStructure blas = build(stack, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geometry, 1);
+            return new GpuGeometry(GEOMETRY_SPHERE, null, null, aabbs, blas);
+        }
+    }
+
+    private void destroyGeometry(GpuGeometry geometry) {
+        destroy(geometry.blas());
+        memory.destroy(geometry.vertices());
+        memory.destroy(geometry.indices());
+        memory.destroy(geometry.aabbs());
     }
 
     // --- Instances / TLAS ---
@@ -181,7 +227,7 @@ public final class RayTracingScene {
         ByteBuffer info = instanceInfo.mapped();
         for (int i = 0; i < count; i++) {
             SceneDescription.Instance instance = scene.instances().get(i);
-            GpuMesh mesh = meshes.get(instance.mesh().path());
+            GpuGeometry geometry = geometries.get(instance.geometry().key());
 
             VkAccelerationStructureInstanceKHR vkInstance = vkInstances.get(i);
             float[] transform = instance.transform();
@@ -192,15 +238,9 @@ public final class RayTracingScene {
                     .mask(0xFF)
                     .instanceShaderBindingTableRecordOffset(0)
                     .flags(VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR)
-                    .accelerationStructureReference(mesh.blas().deviceAddress());
+                    .accelerationStructureReference(geometry.blas().deviceAddress());
 
-            int base = i * INSTANCE_INFO_SIZE;
-            info.putLong(base, mesh.vertices().deviceAddress());
-            info.putLong(base + 8, mesh.indices().deviceAddress());
-            info.putFloat(base + 16, instance.albedo()[0]);
-            info.putFloat(base + 20, instance.albedo()[1]);
-            info.putFloat(base + 24, instance.albedo()[2]);
-            info.putFloat(base + 28, instance.materialType());
+            writeInstanceInfo(info, i * INSTANCE_INFO_SIZE, geometry, instance.material());
         }
 
         try (MemoryStack stack = stackPush()) {
@@ -215,6 +255,32 @@ public final class RayTracingScene {
 
             tlas = build(stack, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, geometry, count);
         }
+    }
+
+    /**
+     * InstanceInfo layout (std430, 64 bytes):
+     *   0  uint64 vertexAddress     8 uint64 indexAddress
+     *  16  vec4   albedo.rgb, roughness
+     *  32  vec4   emission.rgb (albedo * strength), ior
+     *  48  uint   materialType     52 uint geometryType    56..63 padding
+     */
+    private static void writeInstanceInfo(ByteBuffer info, int base, GpuGeometry geometry, Material material) {
+        float[] albedo = material.albedo();
+        float emission = material.type() == Material.Type.EMISSIVE ? material.emission() : 0f;
+        info.putLong(base, geometry.vertices() != null ? geometry.vertices().deviceAddress() : 0L);
+        info.putLong(base + 8, geometry.indices() != null ? geometry.indices().deviceAddress() : 0L);
+        info.putFloat(base + 16, albedo[0]);
+        info.putFloat(base + 20, albedo[1]);
+        info.putFloat(base + 24, albedo[2]);
+        info.putFloat(base + 28, material.roughness());
+        info.putFloat(base + 32, albedo[0] * emission);
+        info.putFloat(base + 36, albedo[1] * emission);
+        info.putFloat(base + 40, albedo[2] * emission);
+        info.putFloat(base + 44, material.ior());
+        info.putInt(base + 48, material.type().ordinal());
+        info.putInt(base + 52, geometry.type());
+        info.putInt(base + 56, 0);
+        info.putInt(base + 60, 0);
     }
 
     private void destroyTopLevel() {

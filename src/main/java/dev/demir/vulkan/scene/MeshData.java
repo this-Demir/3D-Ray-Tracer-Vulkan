@@ -8,12 +8,18 @@ package dev.demir.vulkan.scene;
  * @param positions x, y, z per vertex
  * @param indices   three vertex indices per triangle
  */
-public record MeshData(String path, float[] positions, int[] indices) {
+public record MeshData(String path, float[] positions, int[] indices) implements Geometry {
+
+    @Override
+    public String key() {
+        return path;
+    }
 
     public int vertexCount() {
         return positions.length / 3;
     }
 
+    @Override
     public int triangleCount() {
         return indices.length / 3;
     }

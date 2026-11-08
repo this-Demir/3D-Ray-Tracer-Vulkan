@@ -23,10 +23,18 @@ public final class MeshLibrary {
     private final Map<String, MeshData> cache = new ConcurrentHashMap<>();
 
     /**
-     * Returns the mesh for the given file, loading it on first use.
+     * Returns the geometry for a model path: a built-in primitive for {@link SphereGeometry#KEY},
+     * otherwise the mesh loaded from that file (cached after the first load).
      * @throws UncheckedIOException if the file cannot be loaded
      */
-    public MeshData get(String path) {
+    public Geometry get(String path) {
+        if (SphereGeometry.KEY.equals(path)) {
+            return SphereGeometry.INSTANCE;
+        }
+        return getMesh(path);
+    }
+
+    private MeshData getMesh(String path) {
         return cache.computeIfAbsent(path, p -> {
             try {
                 return load(p);

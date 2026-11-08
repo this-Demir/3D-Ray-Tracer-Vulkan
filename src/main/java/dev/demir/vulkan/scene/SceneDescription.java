@@ -13,20 +13,19 @@ public record SceneDescription(List<Instance> instances) {
     }
 
     /**
-     * One placed copy of a mesh.
+     * One placed copy of a geometry.
      *
-     * @param mesh         shared mesh data (one BLAS per distinct mesh on the GPU)
-     * @param transform    object-to-world, row-major 3x4
-     * @param albedo       r, g, b
-     * @param materialType 0 = matte, 1 = metal, 2 = fuzzy metal, 3 = emissive
+     * @param geometry  shared shape data (one BLAS per distinct geometry on the GPU)
+     * @param transform object-to-world, row-major 3x4
+     * @param material  surface material
      */
-    public record Instance(MeshData mesh, float[] transform, float[] albedo, float materialType) {
+    public record Instance(Geometry geometry, float[] transform, Material material) {
     }
 
     public long triangleCount() {
         long total = 0;
         for (Instance instance : instances) {
-            total += instance.mesh().triangleCount();
+            total += instance.geometry().triangleCount();
         }
         return total;
     }

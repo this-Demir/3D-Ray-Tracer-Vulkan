@@ -5,8 +5,10 @@ import dev.demir.vulkan.engine.RenderSettings;
 import dev.demir.vulkan.engine.VulkanEngine;
 import dev.demir.vulkan.renderer.FrameData;
 import dev.demir.vulkan.scene.Camera;
-import dev.demir.vulkan.scene.MeshData;
+import dev.demir.vulkan.scene.Geometry;
+import dev.demir.vulkan.scene.Material;
 import dev.demir.vulkan.scene.MeshLibrary;
+import dev.demir.vulkan.scene.SphereGeometry;
 import dev.demir.vulkan.scene.ModelInstance;
 import dev.demir.vulkan.scene.Scene;
 import dev.demir.vulkan.scene.SceneDescription;
@@ -281,8 +283,9 @@ public class VulkanApp {
         List<SceneDescription.Instance> instances = new ArrayList<>();
         for (InstanceSpec spec : specs) {
             try {
-                MeshData mesh = meshLibrary.get(spec.modelPath());
-                instances.add(new SceneDescription.Instance(mesh, spec.transform(), spec.albedo(), spec.materialType()));
+                Geometry geometry = meshLibrary.get(spec.modelPath());
+                instances.add(new SceneDescription.Instance(geometry, spec.transform(),
+                        Material.fromLegacy(spec.albedo(), spec.materialType())));
             } catch (RuntimeException e) {
                 System.err.println("WARN (SRT): Skipping '" + spec.name() + "': " + e.getMessage());
             }
@@ -364,7 +367,18 @@ public class VulkanApp {
         addButton.addActionListener(e -> addModelInstance());
         JButton removeButton = new JButton("Remove");
         removeButton.addActionListener(e -> removeSelectedInstance());
+        JButton addSphereButton = new JButton("Add Sphere");
+        addSphereButton.addActionListener(e -> {
+            ModelInstance sphere = new ModelInstance(SphereGeometry.KEY, "Sphere");
+            sphere.setScale(new Vec3(5, 5, 5));
+            sphere.setPosition(new Vec3(15, -5, 0));
+            scene.addInstance(sphere);
+            listModel.addElement(sphere);
+            sceneObjectList.setSelectedValue(sphere, true);
+            rebuildSceneAsync();
+        });
         buttonPanel.add(addButton);
+        buttonPanel.add(addSphereButton);
         buttonPanel.add(removeButton);
 
         // --- 3. Global Settings Panel (NEW) ---
@@ -444,7 +458,8 @@ public class VulkanApp {
                 new MaterialPreset("Matte (Lambertian)", 0.0f),
                 new MaterialPreset("Metal (Shiny)", 1.0f),
                 new MaterialPreset("Metal (Fuzzy)", 2.0f),
-                new MaterialPreset("Emissive (Light)", 3.0f)
+                new MaterialPreset("Emissive (Light)", 3.0f),
+                new MaterialPreset("Glass", 4.0f)
         });
 
         // --- Add components to panel using GridBagLayout ---
