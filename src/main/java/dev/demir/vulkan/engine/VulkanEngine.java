@@ -50,7 +50,7 @@ public class VulkanEngine implements Runnable {
     private static final int FRAMES_IN_FLIGHT = 2;
 
     /** Frame UBO (std140, must match FrameUBO in pathtrace.comp). */
-    private static final int FRAME_UBO_SIZE = 96;
+    private static final int FRAME_UBO_SIZE = 128;
 
     // SPIR-V compiled at build time from src/main/shaders by the Gradle task 'compileShaders'.
     private static final String SHADER_RESOURCE = "/shaders/pathtrace.comp.spv";
@@ -369,6 +369,18 @@ public class VulkanEngine implements Runnable {
         ubo.putInt(76, rtScene.lightCount());
         ubo.putFloat(80, settings.exposure());
         ubo.putFloat(84, (float) sceneTime);
+        // 96: black hole (position, mass; mass 0 = none)   112: disk inner, outer, brightness, gravity on
+        dev.demir.vulkan.scene.BlackHole hole = rtScene.blackHole();
+        if (hole != null) {
+            putVec4(ubo, 96, hole.position());
+            ubo.putFloat(108, (float) hole.mass());
+            ubo.putFloat(112, (float) hole.diskInner());
+            ubo.putFloat(116, (float) hole.diskOuter());
+            ubo.putFloat(120, (float) hole.diskBrightness());
+            ubo.putFloat(124, settings.gravity() ? 1f : 0f);
+        } else {
+            for (int offset = 96; offset < 128; offset += 4) ubo.putFloat(offset, 0f);
+        }
     }
 
     private static void putVec4(ByteBuffer buffer, int offset, Vec3 v) {

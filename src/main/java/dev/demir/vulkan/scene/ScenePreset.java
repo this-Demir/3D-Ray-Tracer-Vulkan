@@ -14,9 +14,11 @@ import java.util.function.Supplier;
  * @param cameraLookAt point the camera looks at
  * @param vfov     vertical field of view in degrees
  * @param settings sky, exposure, bounce and sample limits
+ * @param blackHole the black hole of the scene, or null
  */
 public record ScenePreset(String name, Supplier<List<ModelInstance>> objects,
-                          Vec3 cameraOrigin, Vec3 cameraLookAt, double vfov, RenderSettings settings) {
+                          Vec3 cameraOrigin, Vec3 cameraLookAt, double vfov, RenderSettings settings,
+                          BlackHole blackHole) {
 
     @Override
     public String toString() {

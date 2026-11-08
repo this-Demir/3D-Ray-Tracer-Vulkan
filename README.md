@@ -5,7 +5,7 @@
 
 **Author:** Demir Demirdöğen
 
-> **Work in Progress:** This project is actively under development. Features, render techniques, and UI elements are subject to change as new capabilities are implemented (next: a black hole scene with gravitationally bent light paths).
+> **Work in Progress:** This project is actively under development. Features, render techniques, and UI elements are subject to change as new capabilities are implemented (next: a denoiser for moving cameras and a rotating Kerr black hole).
 
 A high-performance, real-time **GPU Ray Tracer** written in Java using **LWJGL** and **Vulkan**.
 
@@ -22,6 +22,7 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 * **Instancing:** Each model file becomes one BLAS in VRAM, shared by every copy in the scene. Moving, scaling or recoloring objects only rebuilds the TLAS (a few milliseconds).
 * **Path Tracing:** Progressive accumulation (the image keeps refining until a sample limit), materials **Matte**, **Metal** (roughness 0 = mirror), **Glass** (refraction, Fresnel) and **Light** (emissive), direct light sampling with shadow rays towards spherical lights, Russian roulette, ACES tone mapping and exposure.
 * **Animation:** Objects can orbit other objects (or the origin) and spin; orbits nest (a moon around a planet around a sun). The TLAS is rebuilt on the GPU inside every frame.
+* **Black Hole:** Camera rays follow exact Schwarzschild light paths (RK4 integration, each step traced as a ray query), with a relativistic accretion disk (gravitational and Doppler shift, g⁴ beaming). Verified against known results: the rendered shadow is 171.0 px for a predicted 171.4 px.
 * **Multi-Threaded Architecture:**
     * **UI Thread:** Responsive Swing Interface (never freezes).
     * **Vulkan Render Thread (VRT):** Dedicated rendering loop with two frames in flight; the only thread that makes Vulkan calls.
@@ -37,6 +38,9 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 | **ShowRoom** | **Custom** |
 | ![ShowRoom](render_images/rt/showroom.jpg) | ![Custom](render_images/rt/custom.jpg) |
 | Models on a platform in front of a mirror wall, lit by the sky. The airplane can turn like on a display turntable. | A ground plane and a figure: the starting point for your own scene. |
+| **Black Hole** | **Black Hole without gravity** |
+| ![Black Hole](render_images/rt/black-hole.jpg) | ![No gravity](render_images/rt/black-hole-no-gravity.jpg) |
+| Light bent around a Schwarzschild black hole: the far side of the accretion disk shows above and below the shadow, a planet hidden behind the hole appears as Einstein arcs, the approaching side of the disk is brighter (Doppler beaming). See [docs/black-hole.md](docs/black-hole.md) for the physics and its verification. | The same scene with straight light rays, for comparison: the horizon is a black sphere and the planet behind it is hidden. |
 
 ##  System & Performance
 
@@ -84,7 +88,7 @@ graph TD
 * **W / S, A / D, Q / E:** Move forward / back, left / right, up / down (camera and target together)
 
 ### Side Panel
-* **Scene:** Load a preset (Custom, Mirror Room, Eclipse, ShowRoom); sky light, maximum bounces, exposure, sample limit (rendering stops when reached, 0 = never) and *Play animation*.
+* **Scene:** Load a preset (Custom, Mirror Room, Eclipse, ShowRoom, Black Hole, Black Hole: Shadow); sky light, maximum bounces, exposure, sample limit (rendering stops when reached, 0 = never), *Play animation* and *Gravity bends light* (black hole scenes).
 * **Object pool:** The sphere primitive and the models in `objects/`. *Add* (or double-click) places one where the camera looks; *Browse...* adds any `.obj` file.
 * **Objects:** The objects in the scene, with *Duplicate* and *Remove*.
 * **Object settings:** Name, position, rotation, scale, material (color, roughness, light brightness, index of refraction) and animation (orbit center, orbit period, spin period) of the selected object.

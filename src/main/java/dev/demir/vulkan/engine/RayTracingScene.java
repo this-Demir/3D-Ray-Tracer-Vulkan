@@ -136,6 +136,11 @@ public final class RayTracingScene {
         return scene != null && scene.isAnimated();
     }
 
+    /** The scene's black hole, or null. */
+    public dev.demir.vulkan.scene.BlackHole blackHole() {
+        return scene == null ? null : scene.blackHole();
+    }
+
     /**
      * Animated scenes: writes the transforms for 'time' into this slot's instance and light
      * buffers (the slot's previous frame has finished) and records a TLAS rebuild into cmd,

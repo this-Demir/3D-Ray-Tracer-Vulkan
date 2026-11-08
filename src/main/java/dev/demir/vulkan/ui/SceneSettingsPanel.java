@@ -18,6 +18,7 @@ public final class SceneSettingsPanel extends JPanel {
     private final JComboBox<ScenePreset> presetBox;
     private final JCheckBox skyBox = new JCheckBox("Sky light");
     private final JCheckBox animateBox = new JCheckBox("Play animation (orbits, spins)");
+    private final JCheckBox gravityBox = new JCheckBox("Gravity bends light (black hole)");
     private final JSpinner bouncesSpinner = new JSpinner(new SpinnerNumberModel(10, 1, 64, 1));
     private final JSlider exposureSlider = new JSlider(-50, 50, 0); // tenths of a stop
     private final JLabel exposureLabel = new JLabel("0.0 EV");
@@ -53,9 +54,11 @@ public final class SceneSettingsPanel extends JPanel {
         Forms.row(this, 3, "Exposure:", exposureRow);
         Forms.row(this, 4, "Samples:", samplesSpinner);
         Forms.row(this, 5, "", animateBox);
+        Forms.row(this, 6, "", gravityBox);
 
         skyBox.addActionListener(e -> fireChanged());
         animateBox.addActionListener(e -> fireChanged());
+        gravityBox.addActionListener(e -> fireChanged());
         bouncesSpinner.addChangeListener(e -> fireChanged());
         samplesSpinner.addChangeListener(e -> fireChanged());
         exposureSlider.addChangeListener(e -> {
@@ -75,6 +78,7 @@ public final class SceneSettingsPanel extends JPanel {
             exposureLabel.setText(String.format("%.1f EV", settings.exposure()));
             samplesSpinner.setValue(settings.maxSamples());
             animateBox.setSelected(settings.animate());
+            gravityBox.setSelected(settings.gravity());
         } finally {
             updating = false;
         }
@@ -83,6 +87,6 @@ public final class SceneSettingsPanel extends JPanel {
     private void fireChanged() {
         if (updating) return;
         onSettingsChanged.accept(new RenderSettings(skyBox.isSelected(), exposureSlider.getValue() / 10f,
-                (Integer) bouncesSpinner.getValue(), (Integer) samplesSpinner.getValue(), animateBox.isSelected()));
+                (Integer) bouncesSpinner.getValue(), (Integer) samplesSpinner.getValue(), animateBox.isSelected(), gravityBox.isSelected()));
     }
 }

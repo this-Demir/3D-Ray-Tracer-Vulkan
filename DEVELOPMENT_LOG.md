@@ -14,10 +14,11 @@ The renderer was rebuilt around the GPU's ray tracing hardware (RT cores). In or
 6. **Analytic spheres** (single-AABB BLAS, exact intersection in the shader) and **path tracing**: progressive accumulation, matte / metal / glass / emissive materials, direct light sampling with shadow rays towards spherical lights, Russian roulette, ACES tone mapping.
 7. **Editor and scenes:** new side panel (scene settings, object pool, object list, object settings), mouse orbit / zoom camera, and the presets Custom, Mirror Room, Eclipse and ShowRoom.
 8. **Animation:** objects can orbit other objects and spin; the TLAS is rebuilt on the GPU inside every frame.
+9. **Black hole:** camera rays follow exact Schwarzschild light paths (RK4 on dx/dλ = v, dv/dλ = -3Mh²x/r⁵), each step traced as a ray query; thin accretion disk from 6M with gravitational and Doppler shift. A CPU twin of the integrator is unit-tested against exact results, and the rendered shadow measures 171.0 px for a predicted 171.4 px. Details: [docs/black-hole.md](docs/black-hole.md).
 
-### Next: Black Hole
+### Next
 
-A black hole scene with gravitationally bent light: rays are integrated along Schwarzschild null geodesics in small steps, each step traced as a straight ray query, with a thin accretion disk (inner edge at the ISCO, 6M), Doppler and gravitational redshift, and a planet that becomes visible only through lensing. The physics is checked against known results (photon sphere at 3M, critical impact parameter 3√3 M, shadow size, weak-field deflection).
+A denoiser so that moving cameras and animations look clean sooner, presenting frames through a Vulkan swapchain instead of the Swing image, and a rotating (Kerr) black hole.
 
 ## Earlier Status: Live Viewer with a CPU-built BVH
 
