@@ -6,6 +6,23 @@ Return to main documentation: [README.md](./README.md)
 
 ---
 
+## Hardware Ray Tracing Scenes (2026)
+
+Rendered with the RT-core path tracer on an NVIDIA RTX 5060 Ti (the built-in scene presets).
+
+<table>
+  <tr>
+    <td align="center"><img src="render_images/rt/mirror-room.jpg" width="400" /><br/><sub>Mirror Room</sub></td>
+    <td align="center"><img src="render_images/rt/eclipse.jpg" width="400" /><br/><sub>Eclipse</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="render_images/rt/showroom.jpg" width="400" /><br/><sub>ShowRoom</sub></td>
+    <td align="center"><img src="render_images/rt/custom.jpg" width="400" /><br/><sub>Custom</sub></td>
+  </tr>
+</table>
+
+---
+
 ### TB2 Model Renders
 
 

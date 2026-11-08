@@ -1,8 +1,25 @@
-# Vulkan BVH Ray Tracer
+# Vulkan Ray Tracer: Development Log
 
-This project is a high-performance, real-time ray tracer written in Java using Vulkan (via LWJGL) and a Java Swing UI. It uses a Bounding Volume Hierarchy (BVH) built on the CPU to achieve dynamic `O(log n)` rendering performance on the GPU.
+This project is a real-time ray tracer written in Java using Vulkan (via LWJGL) and a Java Swing UI. The sections below go from newest to oldest; the older ones are kept as the history of the project.
 
-## Current Status (Live Viewer)
+## Current Status: Hardware Ray Tracing (November 2026)
+
+The renderer was rebuilt around the GPU's ray tracing hardware (RT cores). In order:
+
+1. **Runs out of the box:** validation layers are optional (`-Dvulkan.validation=true`), GLFW was removed (not needed for a compute-only renderer), and the LWJGL stack size was raised so instance creation no longer overflows on drivers with many extensions.
+2. **Cleanup:** removed an unused older renderer copy, unused classes, shaders and libraries (about 1800 lines).
+3. **Gradle build:** LWJGL comes from Maven Central; shaders are compiled from `src/main/shaders` with shaderc during the build (`./gradlew run`).
+4. **Hardware ray tracing:** the CPU-built BVH was replaced by Vulkan acceleration structures (one BLAS per mesh, one TLAS over the instances) traced with `rayQueryEXT` from the compute shader. GPU time per frame dropped from 29 ms to 0.6 ms (~49k triangles) and from 1129 ms to 0.7 ms (~1M triangles).
+5. **Frame pipeline:** two frames in flight, cached readback, BGRA output copied straight into the Swing image, GPU timestamp queries: about 2000 rendered frames per second on the default scene.
+6. **Analytic spheres** (single-AABB BLAS, exact intersection in the shader) and **path tracing**: progressive accumulation, matte / metal / glass / emissive materials, direct light sampling with shadow rays towards spherical lights, Russian roulette, ACES tone mapping.
+7. **Editor and scenes:** new side panel (scene settings, object pool, object list, object settings), mouse orbit / zoom camera, and the presets Custom, Mirror Room, Eclipse and ShowRoom.
+8. **Animation:** objects can orbit other objects and spin; the TLAS is rebuilt on the GPU inside every frame.
+
+### Next: Black Hole
+
+A black hole scene with gravitationally bent light: rays are integrated along Schwarzschild null geodesics in small steps, each step traced as a straight ray query, with a thin accretion disk (inner edge at the ISCO, 6M), Doppler and gravitational redshift, and a planet that becomes visible only through lensing. The physics is checked against known results (photon sphere at 3M, critical impact parameter 3√3 M, shadow size, weak-field deflection).
+
+## Earlier Status: Live Viewer with a CPU-built BVH
 
 The project has evolved from a "headless" renderer into a "smart," multi-threaded, real-time viewer with a stable Swing (`JFrame`) UI.
 
@@ -13,11 +30,11 @@ The project has evolved from a "headless" renderer into a "smart," multi-threade
     2.  **VRT (Vulkan Engine Thread):** A dedicated thread running the `VulkanEngine` class, which manages all Vulkan calls and the render loop.
     3.  **SRT (Scene Rebuild Thread):** A background thread (`CompletableFuture`) that runs the `SceneBuilder` to perform CPU-heavy tasks (like BVH construction) without blocking the UI.
 
-## Future Plan: Interactive Scene Editor
+## Earlier Plan: Interactive Scene Editor (done, see Current Status)
 
 The next goal is to evolve this viewer into a fully interactive scene editor, similar to the `raytracer-java` project, by implementing a path tracing shader and a scene management system.
 
-### Current Development Roadmap
+### Roadmap at the time (done)
 
 1.  **Phase 1: Scene Graph System (CPU)**
     * Create a `Scene.java` class to manage a dynamic list of objects (`Meshes`, `Spheres`, etc.) instead of a single static model.
@@ -102,7 +119,7 @@ This entire process is managed by a central `RenderService` class to ensure thre
     * `VRT` (next loop) -> `vkDeviceWaitIdle()`, destroys old GPU buffers, uploads new `cpuData`, and proceeds.
     * *(The VRT now renders the NEW scene. The UI never froze.)*
 
-## Development Roadmap
+## Roadmap of the JavaFX plan (done)
 
 1.  **Phase 1: Refactor Engine**
     * Convert `VulkanApp.java` into a reusable `VulkanRenderer.java` class with `init()`, `renderFrame(): ByteBuffer`, and `destroy()` methods.
