@@ -1,8 +1,9 @@
 package dev.demir.vulkan.engine;
 
 import dev.demir.vulkan.renderer.FrameData;
-import dev.demir.vulkan.scene.Camera;
+import dev.demir.vulkan.scene.CameraState;
 import dev.demir.vulkan.scene.SceneDescription;
+import dev.demir.vulkan.util.Vec3;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
@@ -23,7 +24,7 @@ import java.util.function.Consumer;
 
 import static dev.demir.vulkan.engine.GpuMemory.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.system.MemoryUtil.memByteBuffer;
+import static org.lwjgl.system.MemoryUtil.memIntBuffer;
 import static org.lwjgl.vulkan.EXTDebugUtils.*;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 import static org.lwjgl.vulkan.VK10.*;
@@ -32,18 +33,23 @@ import static org.lwjgl.vulkan.VK10.*;
  * Core Vulkan engine, running on its own thread (the Vulkan Render Thread, VRT).
  *
  * Renders with hardware ray tracing: a compute shader traces rays through the scene's
- * acceleration structures ({@link RayTracingScene}) with ray queries, writes the image,
- * and the frame is copied back to the CPU for the Swing UI.
+ * acceleration structures ({@link RayTracingScene}) with ray queries, and each frame is
+ * copied back to the CPU for the Swing UI. Two frames are kept in flight, so the GPU
+ * renders frame N while the CPU reads back frame N-1.
  *
- * Other threads talk to it only through the submit* methods (thread-safe queues);
- * all Vulkan calls happen on the VRT. Camera / accumulation state is owned by the UI thread.
+ * Other threads only talk to it through the submit* methods (latest value wins) and read
+ * {@link #stats()}; all Vulkan calls happen on the VRT. The VRT owns the accumulation
+ * counter and restarts it whenever the scene, camera or settings change.
  */
 public class VulkanEngine implements Runnable {
 
     // --- Configuration ---
-    private static final int WIDTH = 1280;
-    private static final int HEIGHT = 720;
-    private static final int CAMERA_UBO_SIZE = 80; // 4 x vec3 (16-byte aligned) + 2 ints, std140
+    public static final int WIDTH = 1280;
+    public static final int HEIGHT = 720;
+    private static final int FRAMES_IN_FLIGHT = 2;
+
+    /** Frame UBO (std140, must match FrameUBO in pathtrace.comp). */
+    private static final int FRAME_UBO_SIZE = 96;
 
     // SPIR-V compiled at build time from src/main/shaders by the Gradle task 'compileShaders'.
     private static final String SHADER_RESOURCE = "/shaders/pathtrace.comp.spv";
@@ -64,18 +70,35 @@ public class VulkanEngine implements Runnable {
     private static final int BINDING_IMAGE = 0;
     private static final int BINDING_TLAS = 1;
     private static final int BINDING_INSTANCES = 2;
-    private static final int BINDING_CAMERA = 3;
+    private static final int BINDING_FRAME = 3;
+
+    /** Per-frame-in-flight resources. */
+    private static final class FrameSlot {
+        final int index;
+        VkCommandBuffer commandBuffer;
+        long fence = VK_NULL_HANDLE;
+        long descriptorSet = VK_NULL_HANDLE;
+        GpuBuffer frameUbo;
+        GpuBuffer readback;
+        boolean submitted;
+
+        FrameSlot(int index) {
+            this.index = index;
+        }
+    }
 
     // --- Threading & State ---
     private volatile boolean isRunning = true;
     private final Thread thread;
     private final Consumer<Throwable> onFatalError; // Called on the VRT if it crashes
 
-    // --- Thread-Safe Queues ---
-    private final AtomicReference<FrameData> frameQueue;                // VRT -> UI: latest completed frame
-    private final ConcurrentLinkedQueue<SceneDescription> sceneQueue;   // UI/SRT -> VRT: new scene
-    private final ConcurrentLinkedQueue<Camera> cameraQueue;            // UI -> VRT: camera updates
-    private final ConcurrentLinkedQueue<Boolean> skyToggleQueue;        // UI -> VRT: sky on/off
+    // --- Cross-thread communication (latest value wins) ---
+    private final AtomicReference<FrameData> frameQueue;                       // VRT -> UI
+    private final AtomicReference<SceneDescription> pendingScene = new AtomicReference<>();
+    private final AtomicReference<CameraState> pendingCamera = new AtomicReference<>();
+    private final AtomicReference<RenderSettings> pendingSettings = new AtomicReference<>();
+    private final ConcurrentLinkedQueue<int[]> freePixelArrays = new ConcurrentLinkedQueue<>();
+    private volatile EngineStats stats = EngineStats.NONE;
 
     // --- Core Vulkan Objects ---
     private VkInstance instance;
@@ -86,14 +109,10 @@ public class VulkanEngine implements Runnable {
     private int computeQueueFamilyIndex = -1;
     private GpuMemory gpuMemory;
 
-    // --- Render target and readback ---
+    // --- Render target ---
     private long computeImage = VK_NULL_HANDLE;
     private long computeImageMemory = VK_NULL_HANDLE;
     private long computeImageView = VK_NULL_HANDLE;
-    private GpuBuffer readbackBuffer;
-
-    // --- Camera Uniform Buffer Object (persistently mapped) ---
-    private GpuBuffer cameraUbo;
 
     // --- Pipeline Objects ---
     private long computeShaderModule = VK_NULL_HANDLE;
@@ -101,33 +120,38 @@ public class VulkanEngine implements Runnable {
     private long pipelineLayout = VK_NULL_HANDLE;
     private long computePipeline = VK_NULL_HANDLE;
     private long descriptorPool = VK_NULL_HANDLE;
-    private long descriptorSet = VK_NULL_HANDLE;
     private long commandPool = VK_NULL_HANDLE;
-    private VkCommandBuffer commandBuffer;
-    private long fence = VK_NULL_HANDLE;
+    private final FrameSlot[] slots = new FrameSlot[FRAMES_IN_FLIGHT];
 
-    // --- Current State (Managed by VRT) ---
+    // --- GPU timing ---
+    private long queryPool = VK_NULL_HANDLE; // two timestamps per slot
+    private double timestampPeriodNs = 0;     // 0 = timestamps not supported
+
+    // --- Current State (VRT only) ---
     private RayTracingScene rtScene;
     private boolean sceneLoaded = false;
-    private Camera currentCamera = null; // latest camera state sent by the UI thread
-    private int isSkyEnabled = 1; // 1 = true (default ON), 0 = false
+    private CameraState camera;
+    private RenderSettings settings = RenderSettings.DEFAULT;
+    private long sampleIndex = 0; // samples accumulated since the last change
+    private long frameIndex = 0;  // frames submitted in total
+
+    // --- Statistics (VRT only) ---
+    private long statsWindowStart = System.nanoTime();
+    private int statsFrames = 0;
+    private double statsGpuNs = 0;
 
     /**
-     * Constructor. Prepares the engine and its communication channels.
-     * @param frameQueue Thread-safe reference used to publish completed frames to the UI thread.
-     * @param onFatalError Called on the VRT if initialization or rendering fails; the engine stops afterwards.
+     * @param frameQueue   receives the latest finished frame for the UI thread
+     * @param onFatalError called on the VRT if initialization or rendering fails; the engine stops afterwards
      */
     public VulkanEngine(AtomicReference<FrameData> frameQueue, Consumer<Throwable> onFatalError) {
         this.frameQueue = frameQueue;
         this.onFatalError = onFatalError;
-        this.sceneQueue = new ConcurrentLinkedQueue<>();
-        this.cameraQueue = new ConcurrentLinkedQueue<>();
-        this.skyToggleQueue = new ConcurrentLinkedQueue<>();
         this.thread = new Thread(this, "Vulkan-Engine-Thread");
         this.thread.setDaemon(true);
     }
 
-    // --- PUBLIC API (Called by other threads) ---
+    // --- PUBLIC API (called by other threads) ---
 
     /** Starts the Vulkan Render Thread (VRT). */
     public void start() {
@@ -146,21 +170,31 @@ public class VulkanEngine implements Runnable {
         }
     }
 
-    /** Queues a new scene; the VRT swaps to it before its next frame. */
+    /** Replaces the scene before the next frame (only the latest submitted scene is used). */
     public void submitScene(SceneDescription scene) {
-        System.out.println("LOG (VRT-QUEUE): Received submitScene() command.");
-        sceneQueue.add(scene);
+        pendingScene.set(scene);
     }
 
-    /** Queues the latest camera state. */
-    public void submitCameraUpdate(Camera camera) {
-        cameraQueue.add(camera);
+    /** Replaces the camera before the next frame. */
+    public void submitCamera(CameraState cameraState) {
+        pendingCamera.set(cameraState);
     }
 
-    /** Queues a sky light on/off change. */
-    public void submitSkyToggle(boolean isSkyOn) {
-        System.out.println("LOG (VRT-QUEUE): Received submitSkyToggle(" + isSkyOn + ") command.");
-        skyToggleQueue.add(isSkyOn);
+    /** Replaces the render settings before the next frame. */
+    public void submitSettings(RenderSettings renderSettings) {
+        pendingSettings.set(renderSettings);
+    }
+
+    /** Gives a displayed frame's pixel array back for reuse. */
+    public void recycleFrame(FrameData frame) {
+        if (frame != null && freePixelArrays.size() < 4) {
+            freePixelArrays.add(frame.pixels());
+        }
+    }
+
+    /** Latest statistics (updated about once per second). */
+    public EngineStats stats() {
+        return stats;
     }
 
     // --- VULKAN RENDER THREAD (VRT) LOGIC ---
@@ -191,16 +225,16 @@ public class VulkanEngine implements Runnable {
         rtScene = new RayTracingScene(device, gpuMemory);
 
         try (MemoryStack stack = stackPush()) {
-            createCommandPoolAndBuffer(stack);
-            createFence(stack);
+            createCommandPool(stack);
             createDescriptorSetLayout(stack);
             createPipelineLayout(stack);
             createComputePipeline(stack);
             createComputeImage(stack);
-            createReadbackBuffer();
-            createCameraUbo();
             createDescriptorPool(stack);
-            allocateDescriptorSet(stack);
+            createQueryPool(stack);
+            for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                slots[i] = createFrameSlot(stack, i);
+            }
             transitionImageToGeneral();
         }
         System.out.println("LOG (VRT-LIFECYCLE): VulkanEngine initialized successfully.");
@@ -208,136 +242,200 @@ public class VulkanEngine implements Runnable {
 
     private void mainLoop() {
         while (isRunning) {
-            handleCommands();
+            // The slot we are about to reuse holds the oldest frame in flight: publish it first.
+            FrameSlot slot = slots[(int) (frameIndex % FRAMES_IN_FLIGHT)];
+            if (slot.submitted) {
+                waitAndPublish(slot);
+            }
 
-            if (!sceneLoaded || currentCamera == null) {
-                sleep(16);
+            if (applyPendingChanges()) {
+                sampleIndex = 0;
+            }
+
+            boolean done = settings.maxSamples() > 0 && sampleIndex >= settings.maxSamples();
+            if (!sceneLoaded || camera == null || done) {
+                drainFramesInFlight(); // show the last frames before idling
+                updateStats();
+                sleep(5);
                 continue;
             }
 
-            internalUpdateCameraUBO();
-            FrameData frame = renderFrame();
-            frameQueue.set(frame);
+            writeFrameUbo(slot);
+            recordFrame(slot);
+            submitFrame(slot);
+            sampleIndex++;
+            frameIndex++;
+            statsFrames++;
+            updateStats();
         }
+        drainFramesInFlight();
     }
 
-    /**
-     * Processes pending commands. Camera and sky queues are drained so only the latest state is used.
-     */
-    private void handleCommands() {
-        SceneDescription newScene = sceneQueue.poll();
+    /** Applies scene/camera/settings changes from other threads. Returns true if anything changed. */
+    private boolean applyPendingChanges() {
+        boolean changed = false;
+        SceneDescription newScene = pendingScene.getAndSet(null);
         if (newScene != null) {
-            internalSwapScene(newScene);
+            drainFramesInFlight();
+            vkDeviceWaitIdle(device); // resources of the previous scene may still be in use
+            rtScene.update(newScene);
+            try (MemoryStack stack = stackPush()) {
+                for (FrameSlot slot : slots) {
+                    updateDescriptorSet(stack, slot);
+                }
+            }
+            sceneLoaded = true;
+            changed = true;
         }
-
-        Camera newCamera = null;
-        Camera polledCamera;
-        while ((polledCamera = cameraQueue.poll()) != null) {
-            newCamera = polledCamera;
-        }
+        CameraState newCamera = pendingCamera.getAndSet(null);
         if (newCamera != null) {
-            this.currentCamera = newCamera;
+            camera = newCamera;
+            changed = true;
         }
+        RenderSettings newSettings = pendingSettings.getAndSet(null);
+        if (newSettings != null) {
+            settings = newSettings;
+            changed = true;
+        }
+        return changed;
+    }
 
-        Boolean skyState = null;
-        Boolean polledSkyState;
-        while ((polledSkyState = skyToggleQueue.poll()) != null) {
-            skyState = polledSkyState;
-        }
-        if (skyState != null) {
-            int newSkyState = skyState ? 1 : 0;
-            if (this.isSkyEnabled != newSkyState) {
-                System.out.println("LOG (VRT-HANDLE): Sky state set to: " + newSkyState);
-                this.isSkyEnabled = newSkyState;
+    /** Waits for every frame still on the GPU and publishes them, oldest first. */
+    private void drainFramesInFlight() {
+        for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+            FrameSlot slot = slots[(int) ((frameIndex + i) % FRAMES_IN_FLIGHT)];
+            if (slot.submitted) {
+                waitAndPublish(slot);
             }
         }
     }
 
-    /**
-     * Makes the GPU scene match the description and points the descriptor set at it.
-     */
-    private void internalSwapScene(SceneDescription scene) {
-        vkDeviceWaitIdle(device); // resources of the previous scene may still be in use
-        rtScene.update(scene);
+    /** Writes the frame UBO for this slot (std140 layout, see FRAME_UBO_SIZE). */
+    private void writeFrameUbo(FrameSlot slot) {
+        ByteBuffer ubo = slot.frameUbo.mapped();
+        putVec4(ubo, 0, camera.origin());
+        putVec4(ubo, 16, camera.lowerLeft());
+        putVec4(ubo, 32, camera.horizontal());
+        putVec4(ubo, 48, camera.vertical());
+        ubo.putInt(64, (int) sampleIndex);
+        ubo.putInt(68, settings.maxBounces());
+        ubo.putInt(72, settings.skyEnabled() ? 1 : 0);
+        ubo.putInt(76, 0); // light count (filled in once lights exist)
+        ubo.putFloat(80, settings.exposure());
+        ubo.putFloat(84, 0f); // time
+    }
+
+    private static void putVec4(ByteBuffer buffer, int offset, Vec3 v) {
+        buffer.putFloat(offset, (float) v.x);
+        buffer.putFloat(offset + 4, (float) v.y);
+        buffer.putFloat(offset + 8, (float) v.z);
+        buffer.putFloat(offset + 12, 0f);
+    }
+
+    /** Records: timestamps, dispatch of the ray tracing shader, copy of the image into the slot's readback buffer. */
+    private void recordFrame(FrameSlot slot) {
+        VkCommandBuffer cmd = slot.commandBuffer;
         try (MemoryStack stack = stackPush()) {
-            updateDescriptorSet(stack);
+            vkResetCommandBuffer(cmd, 0);
+            vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo.calloc(stack)
+                    .sType$Default()
+                    .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT));
+            if (queryPool != VK_NULL_HANDLE) {
+                vkCmdResetQueryPool(cmd, queryPool, slot.index * 2, 2);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, slot.index * 2);
+            }
+
+            // The previous frame's copy (same queue) must finish reading before this frame writes.
+            imageBarrier(stack, cmd, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
+                    stack.longs(slot.descriptorSet), null);
+            vkCmdDispatch(cmd, (WIDTH + 7) / 8, (HEIGHT + 7) / 8, 1);
+
+            imageBarrier(stack, cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
+                    .imageSubresource(s -> s.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1))
+                    .imageExtent(e -> e.width(WIDTH).height(HEIGHT).depth(1));
+            vkCmdCopyImageToBuffer(cmd, computeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.readback.buffer(), region);
+            imageBarrier(stack, cmd, VK_ACCESS_TRANSFER_READ_BIT, 0,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            // Make the copied pixels visible to the CPU once the fence signals.
+            VkBufferMemoryBarrier.Buffer hostBarrier = VkBufferMemoryBarrier.calloc(1, stack)
+                    .sType$Default()
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_HOST_READ_BIT)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .buffer(slot.readback.buffer())
+                    .size(VK_WHOLE_SIZE);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, null, hostBarrier, null);
+
+            if (queryPool != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, slot.index * 2 + 1);
+            }
+            check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         }
-        sceneLoaded = true;
     }
 
-    /** Writes the camera into the persistently mapped UBO (std140 layout, see CAMERA_UBO_SIZE). */
-    private void internalUpdateCameraUBO() {
-        ByteBuffer ubo = cameraUbo.mapped();
-        currentCamera.getOrigin().store(0, ubo);
-        currentCamera.getLowerLeft().store(16, ubo);
-        currentCamera.getHorizontal().store(32, ubo);
-        currentCamera.getVertical().store(48, ubo);
-        ubo.putInt(64, currentCamera.getFrameCount());
-        ubo.putInt(68, this.isSkyEnabled);
-    }
-
-    /** Renders one frame and returns a copy of its pixels (RGBA8). */
-    private FrameData renderFrame() {
+    private void submitFrame(FrameSlot slot) {
         try (MemoryStack stack = stackPush()) {
-            recordComputeCommands(stack);
-
             VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
                     .sType$Default()
-                    .pCommandBuffers(stack.pointers(commandBuffer));
-            vkResetFences(device, fence);
-            check(vkQueueSubmit(computeQueue, submitInfo, fence), "vkQueueSubmit");
-            vkWaitForFences(device, fence, true, Long.MAX_VALUE);
-
-            // Copy out of the mapped readback buffer; it is overwritten by the next frame.
-            int bufferSize = WIDTH * HEIGHT * 4;
-            ByteBuffer copyPixelData = ByteBuffer.allocateDirect(bufferSize);
-            copyPixelData.put(memByteBuffer(readbackBuffer.mappedAddress(), bufferSize));
-            copyPixelData.flip();
-            return new FrameData(copyPixelData);
+                    .pCommandBuffers(stack.pointers(slot.commandBuffer));
+            vkResetFences(device, slot.fence);
+            check(vkQueueSubmit(computeQueue, submitInfo, slot.fence), "vkQueueSubmit");
+            slot.submitted = true;
         }
     }
 
-    /** Records: dispatch the ray tracing shader, then copy the image into the readback buffer. */
-    private void recordComputeCommands(MemoryStack stack) {
-        vkResetCommandBuffer(commandBuffer, 0);
-        vkBeginCommandBuffer(commandBuffer, VkCommandBufferBeginInfo.calloc(stack)
-                .sType$Default()
-                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT));
+    /** Waits for the slot's frame, reads its GPU time and hands its pixels to the UI. */
+    private void waitAndPublish(FrameSlot slot) {
+        vkWaitForFences(device, slot.fence, true, Long.MAX_VALUE);
+        slot.submitted = false;
 
-        // Barrier 1: previous frame's transfer read must finish before this frame's shader write.
-        imageBarrier(stack, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        if (queryPool != VK_NULL_HANDLE) {
+            try (MemoryStack stack = stackPush()) {
+                LongBuffer timestamps = stack.mallocLong(2);
+                int result = vkGetQueryPoolResults(device, queryPool, slot.index * 2, 2, timestamps, Long.BYTES,
+                        VK_QUERY_RESULT_64_BIT);
+                if (result == VK_SUCCESS) {
+                    statsGpuNs += (timestamps.get(1) - timestamps.get(0)) * timestampPeriodNs;
+                }
+            }
+        }
 
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
-                stack.longs(descriptorSet), null);
-        vkCmdDispatch(commandBuffer, (WIDTH + 7) / 8, (HEIGHT + 7) / 8, 1);
-
-        // Barrier 2: shader write -> transfer read, GENERAL -> TRANSFER_SRC_OPTIMAL.
-        imageBarrier(stack, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
-                .bufferOffset(0)
-                .bufferRowLength(0).bufferImageHeight(0)
-                .imageSubresource(s -> s.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1))
-                .imageOffset(o -> o.x(0).y(0).z(0))
-                .imageExtent(e -> e.width(WIDTH).height(HEIGHT).depth(1));
-        vkCmdCopyImageToBuffer(commandBuffer, computeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                readbackBuffer.buffer(), region);
-
-        // Barrier 3: back to GENERAL for the next frame.
-        imageBarrier(stack, VK_ACCESS_TRANSFER_READ_BIT, 0,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-        check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+        int[] pixels = freePixelArrays.poll();
+        if (pixels == null) {
+            pixels = new int[WIDTH * HEIGHT];
+        }
+        memIntBuffer(slot.readback.mappedAddress(), WIDTH * HEIGHT).get(pixels);
+        recycleFrame(frameQueue.getAndSet(new FrameData(pixels, WIDTH, HEIGHT))); // drop an unshown frame
     }
 
-    private void imageBarrier(MemoryStack stack, int srcAccess, int dstAccess, int oldLayout, int newLayout,
-                              int srcStage, int dstStage) {
+    private void updateStats() {
+        long now = System.nanoTime();
+        long elapsed = now - statsWindowStart;
+        if (elapsed >= 1_000_000_000L) {
+            double fps = statsFrames * 1e9 / elapsed;
+            double gpuMs = statsFrames > 0 ? statsGpuNs / statsFrames / 1e6 : 0;
+            stats = new EngineStats(fps, gpuMs, sampleIndex);
+            statsFrames = 0;
+            statsGpuNs = 0;
+            statsWindowStart = now;
+        } else if (stats.samples() != sampleIndex && statsFrames == 0) {
+            stats = new EngineStats(stats.renderFps(), stats.gpuMs(), sampleIndex);
+        }
+    }
+
+    private void imageBarrier(MemoryStack stack, VkCommandBuffer cmd, int srcAccess, int dstAccess,
+                              int oldLayout, int newLayout, int srcStage, int dstStage) {
         VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
                 .sType$Default()
                 .srcAccessMask(srcAccess)
@@ -349,7 +447,7 @@ public class VulkanEngine implements Runnable {
                 .image(computeImage)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                         .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
-        vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, null, null, barrier);
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, null, null, barrier);
     }
 
     private void cleanup() {
@@ -362,7 +460,13 @@ public class VulkanEngine implements Runnable {
             }
         }
         if (rtScene != null) rtScene.destroy();
-        if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, null);
+        for (FrameSlot slot : slots) {
+            if (slot == null) continue;
+            if (slot.fence != VK_NULL_HANDLE) vkDestroyFence(device, slot.fence, null);
+            gpuMemory.destroy(slot.frameUbo);
+            gpuMemory.destroy(slot.readback);
+        }
+        if (queryPool != VK_NULL_HANDLE) vkDestroyQueryPool(device, queryPool, null);
         if (commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, commandPool, null);
         if (computePipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, computePipeline, null);
         if (pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipelineLayout, null);
@@ -372,11 +476,7 @@ public class VulkanEngine implements Runnable {
         if (computeImageView != VK_NULL_HANDLE) vkDestroyImageView(device, computeImageView, null);
         if (computeImage != VK_NULL_HANDLE) vkDestroyImage(device, computeImage, null);
         if (computeImageMemory != VK_NULL_HANDLE) vkFreeMemory(device, computeImageMemory, null);
-        if (gpuMemory != null) {
-            gpuMemory.destroy(readbackBuffer);
-            gpuMemory.destroy(cameraUbo);
-            gpuMemory.destroy();
-        }
+        if (gpuMemory != null) gpuMemory.destroy();
         if (device != null) vkDestroyDevice(device, null);
         if (debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
         if (instance != null) vkDestroyInstance(instance, null);
@@ -495,6 +595,7 @@ public class VulkanEngine implements Runnable {
                     bestScore = score;
                     bestName = name;
                     physicalDevice = candidate;
+                    timestampPeriodNs = properties.limits().timestampPeriod();
                 }
             }
             if (physicalDevice == null) {
@@ -611,9 +712,9 @@ public class VulkanEngine implements Runnable {
         }
     }
 
-    // --- Render target, readback and UBO ---
+    // --- Render target, frame slots, timing ---
 
-    /** The image the shader writes (storage) and the frame is copied from (transfer source). */
+    /** The image the shader writes (storage) and each frame is copied from (transfer source). */
     private void createComputeImage(MemoryStack stack) {
         VkImageCreateInfo imageInfo = VkImageCreateInfo.calloc(stack)
                 .sType$Default()
@@ -648,32 +749,62 @@ public class VulkanEngine implements Runnable {
         computeImageView = pImageView.get(0);
     }
 
-    private void createReadbackBuffer() {
-        readbackBuffer = gpuMemory.createBuffer((long) WIDTH * HEIGHT * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    private FrameSlot createFrameSlot(MemoryStack stack, int index) {
+        FrameSlot slot = new FrameSlot(index);
+
+        VkCommandBufferAllocateInfo cmdAllocInfo = VkCommandBufferAllocateInfo.calloc(stack)
+                .sType$Default()
+                .commandPool(commandPool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
+        PointerBuffer pCmdBuffer = stack.mallocPointer(1);
+        check(vkAllocateCommandBuffers(device, cmdAllocInfo, pCmdBuffer), "vkAllocateCommandBuffers");
+        slot.commandBuffer = new VkCommandBuffer(pCmdBuffer.get(0), device);
+
+        LongBuffer pFence = stack.mallocLong(1);
+        check(vkCreateFence(device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, pFence), "vkCreateFence");
+        slot.fence = pFence.get(0);
+
+        // CPU reads the frame back: cached host memory makes that read ~10x faster than uncached.
+        slot.readback = gpuMemory.createBuffer((long) WIDTH * HEIGHT * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        slot.frameUbo = gpuMemory.createBuffer(FRAME_UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+
+        VkDescriptorSetAllocateInfo allocSetInfo = VkDescriptorSetAllocateInfo.calloc(stack)
+                .sType$Default()
+                .descriptorPool(descriptorPool)
+                .pSetLayouts(stack.longs(descriptorSetLayout));
+        LongBuffer pDescriptorSet = stack.mallocLong(1);
+        check(vkAllocateDescriptorSets(device, allocSetInfo, pDescriptorSet), "vkAllocateDescriptorSets");
+        slot.descriptorSet = pDescriptorSet.get(0);
+        return slot;
     }
 
-    private void createCameraUbo() {
-        cameraUbo = gpuMemory.createBuffer(CAMERA_UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    private void createQueryPool(MemoryStack stack) {
+        VkQueueFamilyProperties.Buffer families;
+        IntBuffer count = stack.ints(0);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, null);
+        families = VkQueueFamilyProperties.malloc(count.get(0), stack);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, families);
+        if (families.get(computeQueueFamilyIndex).timestampValidBits() == 0 || timestampPeriodNs <= 0) {
+            System.out.println("LOG (VRT-LIFECYCLE): GPU timestamps not supported; GPU time will show as 0.");
+            return;
+        }
+        VkQueryPoolCreateInfo poolInfo = VkQueryPoolCreateInfo.calloc(stack)
+                .sType$Default()
+                .queryType(VK_QUERY_TYPE_TIMESTAMP)
+                .queryCount(FRAMES_IN_FLIGHT * 2);
+        LongBuffer pPool = stack.mallocLong(1);
+        check(vkCreateQueryPool(device, poolInfo, null, pPool), "vkCreateQueryPool");
+        queryPool = pPool.get(0);
     }
 
     private void transitionImageToGeneral() {
         gpuMemory.submitAndWait(cmd -> {
             try (MemoryStack stack = stackPush()) {
-                VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
-                        .sType$Default()
-                        .srcAccessMask(0)
-                        .dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
-                        .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
-                        .newLayout(VK_IMAGE_LAYOUT_GENERAL)
-                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
-                        .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
-                        .image(computeImage)
-                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
-                                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        0, null, null, barrier);
+                imageBarrier(stack, cmd, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             }
         });
     }
@@ -688,7 +819,7 @@ public class VulkanEngine implements Runnable {
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
         bindings.get(2).binding(BINDING_INSTANCES).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
-        bindings.get(3).binding(BINDING_CAMERA).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+        bindings.get(3).binding(BINDING_FRAME).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
 
         VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
@@ -730,32 +861,22 @@ public class VulkanEngine implements Runnable {
 
     private void createDescriptorPool(MemoryStack stack) {
         VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(4, stack);
-        poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
-        poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(1);
-        poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1);
-        poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1);
+        poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(FRAMES_IN_FLIGHT);
+        poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(FRAMES_IN_FLIGHT);
+        poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(FRAMES_IN_FLIGHT);
+        poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(FRAMES_IN_FLIGHT);
 
         VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                 .sType$Default()
                 .pPoolSizes(poolSizes)
-                .maxSets(1);
+                .maxSets(FRAMES_IN_FLIGHT);
         LongBuffer pDescriptorPool = stack.mallocLong(1);
         check(vkCreateDescriptorPool(device, poolInfo, null, pDescriptorPool), "vkCreateDescriptorPool");
         descriptorPool = pDescriptorPool.get(0);
     }
 
-    private void allocateDescriptorSet(MemoryStack stack) {
-        VkDescriptorSetAllocateInfo allocSetInfo = VkDescriptorSetAllocateInfo.calloc(stack)
-                .sType$Default()
-                .descriptorPool(descriptorPool)
-                .pSetLayouts(stack.longs(descriptorSetLayout));
-        LongBuffer pDescriptorSet = stack.mallocLong(1);
-        check(vkAllocateDescriptorSets(device, allocSetInfo, pDescriptorSet), "vkAllocateDescriptorSets");
-        descriptorSet = pDescriptorSet.get(0);
-    }
-
-    /** Points the descriptor set at the current TLAS and instance buffer (called after each scene swap). */
-    private void updateDescriptorSet(MemoryStack stack) {
+    /** Points a slot's descriptor set at the current scene and its own frame UBO (after each scene swap). */
+    private void updateDescriptorSet(MemoryStack stack, FrameSlot slot) {
         VkDescriptorImageInfo.Buffer imageInfo = VkDescriptorImageInfo.calloc(1, stack)
                 .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .imageView(computeImageView);
@@ -764,22 +885,22 @@ public class VulkanEngine implements Runnable {
                 .pAccelerationStructures(stack.longs(rtScene.topLevelAccelerationStructure()));
         VkDescriptorBufferInfo.Buffer instanceInfo = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(rtScene.instanceInfoBuffer().buffer()).offset(0).range(VK_WHOLE_SIZE);
-        VkDescriptorBufferInfo.Buffer cameraInfo = VkDescriptorBufferInfo.calloc(1, stack)
-                .buffer(cameraUbo.buffer()).offset(0).range(VK_WHOLE_SIZE);
+        VkDescriptorBufferInfo.Buffer frameInfo = VkDescriptorBufferInfo.calloc(1, stack)
+                .buffer(slot.frameUbo.buffer()).offset(0).range(VK_WHOLE_SIZE);
 
         VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(4, stack);
-        writes.get(0).sType$Default().dstSet(descriptorSet).dstBinding(BINDING_IMAGE)
+        writes.get(0).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_IMAGE)
                 .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).pImageInfo(imageInfo);
-        writes.get(1).sType$Default().pNext(tlasInfo.address()).dstSet(descriptorSet).dstBinding(BINDING_TLAS)
+        writes.get(1).sType$Default().pNext(tlasInfo.address()).dstSet(slot.descriptorSet).dstBinding(BINDING_TLAS)
                 .descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(1);
-        writes.get(2).sType$Default().dstSet(descriptorSet).dstBinding(BINDING_INSTANCES)
+        writes.get(2).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_INSTANCES)
                 .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).pBufferInfo(instanceInfo);
-        writes.get(3).sType$Default().dstSet(descriptorSet).dstBinding(BINDING_CAMERA)
-                .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1).pBufferInfo(cameraInfo);
+        writes.get(3).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_FRAME)
+                .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1).pBufferInfo(frameInfo);
         vkUpdateDescriptorSets(device, writes, null);
     }
 
-    private void createCommandPoolAndBuffer(MemoryStack stack) {
+    private void createCommandPool(MemoryStack stack) {
         VkCommandPoolCreateInfo cmdPoolInfo = VkCommandPoolCreateInfo.calloc(stack)
                 .sType$Default()
                 .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
@@ -787,18 +908,6 @@ public class VulkanEngine implements Runnable {
         LongBuffer pCmdPool = stack.mallocLong(1);
         check(vkCreateCommandPool(device, cmdPoolInfo, null, pCmdPool), "vkCreateCommandPool");
         commandPool = pCmdPool.get(0);
-        VkCommandBufferAllocateInfo cmdAllocInfo = VkCommandBufferAllocateInfo.calloc(stack)
-                .sType$Default()
-                .commandPool(commandPool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
-        PointerBuffer pCmdBuffer = stack.mallocPointer(1);
-        check(vkAllocateCommandBuffers(device, cmdAllocInfo, pCmdBuffer), "vkAllocateCommandBuffers");
-        commandBuffer = new VkCommandBuffer(pCmdBuffer.get(0), device);
-    }
-
-    private void createFence(MemoryStack stack) {
-        LongBuffer pFence = stack.mallocLong(1);
-        check(vkCreateFence(device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, pFence), "vkCreateFence");
-        fence = pFence.get(0);
     }
 
     /** Reads a SPIR-V binary from the classpath into a direct buffer (Vulkan needs off-heap memory). */

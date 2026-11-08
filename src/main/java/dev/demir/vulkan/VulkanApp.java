@@ -1,5 +1,7 @@
 package dev.demir.vulkan;
 
+import dev.demir.vulkan.engine.EngineStats;
+import dev.demir.vulkan.engine.RenderSettings;
 import dev.demir.vulkan.engine.VulkanEngine;
 import dev.demir.vulkan.renderer.FrameData;
 import dev.demir.vulkan.scene.Camera;
@@ -20,7 +22,7 @@ import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
-import java.awt.image.DataBufferByte;
+import java.awt.image.DataBufferInt;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -50,7 +52,7 @@ public class VulkanApp {
     private JFrame frame;
     private JLabel imageLabel;
     private BufferedImage bufferedImage;
-    private byte[] swizzleBuffer;
+    private int[] imagePixels; // backing array of bufferedImage (0x00RRGGBB)
 
     // --- Scene & UI Controls ---
     private JList<ModelInstance> sceneObjectList;
@@ -78,11 +80,11 @@ public class VulkanApp {
     private final Scene scene = new Scene();
 
     // --- State ---
-    private long lastFrameTime = System.nanoTime();
-    private int frameCount = 0;
+    private RenderSettings renderSettings = RenderSettings.DEFAULT;
+    private long lastTitleUpdate = System.nanoTime();
+    private int displayedFrames = 0;
 
-    // --- 3-THREAD-FIX: This flag pauses accumulation in updateUI() ---
-    private volatile boolean sceneBuildInProgress = false;
+    private boolean sceneBuildInProgress = false; // UI thread only
     private boolean rebuildRequested = false; // UI thread only: an edit arrived during a rebuild
 
     // Set (on the UI thread) when the render thread has crashed; stops the FPS title updates.
@@ -156,7 +158,7 @@ public class VulkanApp {
         // 1. Set up Swing UI
         frame = new JFrame("Vulkan Ray Tracer");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        bufferedImage = new BufferedImage(RENDER_WIDTH, RENDER_HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
+        bufferedImage = new BufferedImage(RENDER_WIDTH, RENDER_HEIGHT, BufferedImage.TYPE_INT_RGB);
         imageLabel = new JLabel(new ImageIcon(bufferedImage));
         frame.getContentPane().add(imageLabel, BorderLayout.CENTER);
 
@@ -167,19 +169,14 @@ public class VulkanApp {
         frame.pack();
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
-        swizzleBuffer = ((DataBufferByte) bufferedImage.getRaster().getDataBuffer()).getData();
+        imagePixels = ((DataBufferInt) bufferedImage.getRaster().getDataBuffer()).getData();
 
-        // 2. Start VulkanEngine Thread (VRT)
-        System.out.println("LOG (UI-RUN): Starting VulkanEngine...");
+        // 2. Start the render thread and give it camera, settings and the first scene
         vulkanEngine.start();
-
-        // 3. Trigger initial scene build (SRT)
+        vulkanEngine.submitCamera(camera.state());
+        vulkanEngine.submitSettings(renderSettings);
         populateDefaultScene();
-        rebuildSceneAsync(); // This will also call resetAccumulation
-
-        // 4. Send initial camera state to the engine
-        // (This is now handled by rebuildSceneAsync's .whenComplete block)
-        System.out.println("LOG (UI-RUN): Waiting for first scene build...");
+        rebuildSceneAsync();
 
         // 5. Start UI Timer
         Timer swingTimer = new Timer(16, (e) -> updateUI());
@@ -201,50 +198,25 @@ public class VulkanApp {
     }
 
     /**
-     * Main UI loop driven by the Swing Timer.
-     * (3-THREAD-FIX): This is now the *only* place frameCount is incremented.
-     * It does *not* send sky state.
+     * UI loop (Swing timer, ~60 Hz): shows the newest finished frame and, once per second,
+     * the statistics. The render thread runs independently and may render many more frames.
      */
     private void updateUI() {
-        String logPrefix = "LOG (UI-TIMER): ";
-
-        if (vulkanEngine != null) {
-
-            // --- 3-THREAD-FIX: PAUSE ACCUMULATION ---
-            // Only increment the frame counter if a scene rebuild (SRT)
-            // is not in progress. This ensures that when the SRT
-            // finishes, the frameCount is still 0.
-            if (!sceneBuildInProgress) {
-                camera.incrementFrameCount();
-                // System.out.println(logPrefix + "Accumulation ON. Incremented frameCount to " + camera.getFrameCount());
-            } else {
-                // System.out.println(logPrefix + "Accumulation PAUSED (SRT running). frameCount is " + camera.getFrameCount());
-            }
-
-            // --- 3-THREAD-FIX: REMOVE OVERRIDE ---
-            // DO NOT send sky state here. This was overriding the
-            // user's selection from the ActionListener.
-            // vulkanEngine.submitSkyToggle(enableSkyCheckBox.isSelected()); // <-- BUG WAS HERE
-
-            // Always send the latest camera state (with the new or paused frameCount)
-            // This drives the continuous accumulation.
-            vulkanEngine.submitCameraUpdate(camera);
-        }
-
         FrameData frameData = latestFrame.getAndSet(null);
         if (frameData != null) {
-            updateBufferedImage(frameData.pixelData);
+            System.arraycopy(frameData.pixels(), 0, imagePixels, 0, imagePixels.length);
+            vulkanEngine.recycleFrame(frameData);
             imageLabel.repaint();
-            frameCount++;
+            displayedFrames++;
         }
         long now = System.nanoTime();
-        if (!renderEngineStopped && now - lastFrameTime >= 1_000_000_000) {
-            // Update FPS counter and also show accumulated frames
-            int accumulatedFrames = (camera != null) ? camera.getFrameCount() : 0;
-            // System.out.println(logPrefix + "FPS Update. Samples: " + accumulatedFrames);
-            frame.setTitle(String.format("Vulkan Ray Tracer | %d FPS | Samples: %d", frameCount, accumulatedFrames));
-            frameCount = 20;
-            lastFrameTime = now;
+        if (!renderEngineStopped && now - lastTitleUpdate >= 1_000_000_000L) {
+            double displayFps = displayedFrames * 1e9 / (now - lastTitleUpdate);
+            EngineStats stats = vulkanEngine.stats();
+            frame.setTitle(String.format("Vulkan Ray Tracer | Render %.0f FPS | GPU %.2f ms | Display %.0f FPS | Samples %d",
+                    stats.renderFps(), stats.gpuMs(), displayFps, stats.samples()));
+            displayedFrames = 0;
+            lastTitleUpdate = now;
         }
     }
 
@@ -277,7 +249,7 @@ public class VulkanApp {
             rebuildRequested = true;
             return;
         }
-        sceneBuildInProgress = true; // pauses accumulation in updateUI()
+        sceneBuildInProgress = true;
         rebuildRequested = false;
 
         List<InstanceSpec> specs = new ArrayList<>();
@@ -295,11 +267,7 @@ public class VulkanApp {
                         JOptionPane.showMessageDialog(frame, "Scene build failed: " + error.getMessage(),
                                 "Scene Error", JOptionPane.ERROR_MESSAGE);
                     } else {
-                        vulkanEngine.submitScene(description);
-                        // Reset accumulation now that the new scene is on its way to the render thread.
-                        camera.resetAccumulation();
-                        vulkanEngine.submitSkyToggle(enableSkyCheckBox.isSelected());
-                        vulkanEngine.submitCameraUpdate(camera);
+                        vulkanEngine.submitScene(description); // the engine restarts accumulation
                     }
                     sceneBuildInProgress = false;
                     if (rebuildRequested) {
@@ -426,23 +394,7 @@ public class VulkanApp {
 
         // --- Enable Sky Light CheckBox ---
         enableSkyCheckBox = new JCheckBox("Enable Sky Light", true);
-        enableSkyCheckBox.addActionListener(e -> {
-            // This is an "event". It resets accumulation.
-            boolean isSkyEnabled = enableSkyCheckBox.isSelected(); // Get the new state
-            System.out.println("LOG (UI-EVENT-SKY): Sky CheckBox clicked. Sending state: " + isSkyEnabled);
-
-            // 1. Send the new state
-            vulkanEngine.submitSkyToggle(isSkyEnabled);
-
-            // 2. Reset the counter
-            camera.resetAccumulation();
-            System.out.println("LOG (UI-EVENT-SKY): camera.resetAccumulation() called. frameCount is now 0.");
-
-            // 3. Send the reset (frameCount=0)
-            // !!! BU SATIR BÜYÜK İHTİMALLE EKSİKTİ !!!
-            vulkanEngine.submitCameraUpdate(camera);
-            System.out.println("LOG (UI-EVENT-SKY): submitCameraUpdate(fc=0) called.");
-        });
+        enableSkyCheckBox.addActionListener(e -> updateSettings(renderSettings.withSky(enableSkyCheckBox.isSelected())));
         addLabelAndComponent(panel, "", enableSkyCheckBox, gbc, 0); // No label
 
         // --- Exposure (Composure) Slider ---
@@ -454,20 +406,7 @@ public class VulkanApp {
 
         exposureSlider.addChangeListener(e -> {
             if (!exposureSlider.getValueIsAdjusting()) {
-                // This is an "event". It resets accumulation.
-                float exposureValue = exposureSlider.getValue() / 10.0f;
-                System.out.println("LOG (UI-EVENT-EXPOSURE): Exposure set to: " + exposureValue);
-
-                // --- TODO: Send exposure value to VulkanEngine ---
-                // vulkanEngine.submitExposureUpdate(exposureValue);
-
-                camera.resetAccumulation(); // 1. Reset the counter
-                System.out.println("LOG (UI-EVENT-EXPOSURE): camera.resetAccumulation() called. frameCount is now 0.");
-                // 2. Send the *current* sky state along with the reset
-                boolean isSkyEnabled = enableSkyCheckBox.isSelected();
-                vulkanEngine.submitSkyToggle(isSkyEnabled);
-                vulkanEngine.submitCameraUpdate(camera); // 3. Send the reset (frameCount=0)
-                System.out.println("LOG (UI-EVENT-EXPOSURE): submitSkyToggle(" + isSkyEnabled + ") and submitCameraUpdate(fc=0) called.");
+                updateSettings(renderSettings.withExposure(exposureSlider.getValue() / 10.0f));
             }
         });
         addLabelAndComponent(panel, "Exposure:", exposureSlider, gbc, 1);
@@ -754,22 +693,8 @@ public class VulkanApp {
             CameraAction(String key, Vec3 moveVector) { this.key = key; this.moveVector = moveVector; }
             @Override
             public void actionPerformed(ActionEvent e) {
-                String logPrefix = "LOG (UI-EVENT-KEY): ";
-                System.out.println(logPrefix + "Key '" + key + "' pressed.");
-
                 camera.setOrigin(camera.getOrigin().add(moveVector));
-
-                // This is an "event". It resets accumulation.
-                camera.resetAccumulation(); // 1. Reset the counter
-                System.out.println(logPrefix + "camera.resetAccumulation() called. frameCount is now 0.");
-
-                // 2. Send the *current* sky state along with the reset
-                boolean isSkyEnabled = enableSkyCheckBox.isSelected();
-                vulkanEngine.submitSkyToggle(isSkyEnabled);
-
-                // 3. Send the reset (frameCount=0)
-                vulkanEngine.submitCameraUpdate(camera);
-                System.out.println(logPrefix + "submitSkyToggle(" + isSkyEnabled + ") and submitCameraUpdate(fc=0) called.");
+                vulkanEngine.submitCamera(camera.state()); // the engine restarts accumulation
             }
         }
 
@@ -791,20 +716,9 @@ public class VulkanApp {
     }
 
 
-    /**
-     * Copies Vulkan's ByteBuffer (RGBA) into Swing's BufferedImage (BGR).
-     */
-    private void updateBufferedImage(ByteBuffer pixelData) {
-        if (pixelData.capacity() < (RENDER_WIDTH * RENDER_HEIGHT * 4)) {
-            // Can happen if the scene is empty (returns 1-byte buffer)
-            return;
-        }
-        pixelData.rewind();
-        for (int i = 0; i < (RENDER_WIDTH * RENDER_HEIGHT); i++) {
-            // Vulkan (RGBA) -> Swing (BGR)
-            swizzleBuffer[i * 3 + 0] = pixelData.get(i * 4 + 2); // Blue
-            swizzleBuffer[i * 3 + 1] = pixelData.get(i * 4 + 1); // Green
-            swizzleBuffer[i * 3 + 2] = pixelData.get(i * 4 + 0); // Red
-        }
+    /** Sends new render settings to the engine (which restarts accumulation). */
+    private void updateSettings(RenderSettings settings) {
+        renderSettings = settings;
+        vulkanEngine.submitSettings(settings);
     }
 }

@@ -1,17 +1,9 @@
 package dev.demir.vulkan.renderer;
 
-import java.nio.ByteBuffer;
-
 /**
- * POJO: Render'ı tamamlanmış bir karenin (frame) piksel verisini
- * VRT (Vulkan Render Thread) -> FXAT (JavaFX Thread) arasında taşır.
+ * A finished frame, handed from the render thread to the UI thread.
+ * Pixels are 0x00RRGGBB ints (the layout of BufferedImage.TYPE_INT_RGB), row by row, top row first.
+ * The array is pooled: the UI gives the frame back with VulkanEngine.recycleFrame() after copying it.
  */
-public class FrameData {
-
-    public final ByteBuffer pixelData;
-    // TODO : RENDER STATISTICS
-
-    public FrameData(ByteBuffer pixelData) {
-        this.pixelData = pixelData;
-    }
+public record FrameData(int[] pixels, int width, int height) {
 }

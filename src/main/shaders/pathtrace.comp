@@ -25,12 +25,18 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Ind
 layout(rgba8, set = 0, binding = 0) uniform restrict writeonly image2D resultImage;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT topLevelAS;
 layout(std430, set = 0, binding = 2) readonly buffer InstanceBuffer { InstanceInfo instances[]; };
-layout(std140, set = 0, binding = 3) uniform CameraUBO {
-    vec3 origin;
-    vec3 lower_left_corner;
-    vec3 horizontal;
-    vec3 vertical;
-} cam;
+layout(std140, set = 0, binding = 3) uniform FrameUBO {
+    vec4  origin;            // camera, xyz used
+    vec4  lowerLeft;
+    vec4  horizontal;
+    vec4  vertical;
+    uint  sampleIndex;       // samples accumulated before this frame
+    uint  maxBounces;
+    uint  skyEnabled;
+    uint  lightCount;
+    float exposure;          // stops (EV)
+    float time;              // seconds, for animation
+} frame;
 
 // --- Constants ---
 const float T_MIN = 0.001;
@@ -152,8 +158,8 @@ void main() {
     float v = (float(image_size.y - 1 - pixel_coords.y) + randomFloat()) / float(image_size.y);
 
     Ray r;
-    r.origin = cam.origin;
-    r.dir = normalize(cam.lower_left_corner + cam.horizontal * u + cam.vertical * v - cam.origin);
+    r.origin = frame.origin.xyz;
+    r.dir = normalize(frame.lowerLeft.xyz + frame.horizontal.xyz * u + frame.vertical.xyz * v - frame.origin.xyz);
 
     vec3 final_color = vec3(0.0);
     vec3 attenuation = vec3(1.0);
@@ -181,6 +187,8 @@ void main() {
         // A path still bouncing after MAX_BOUNCES contributes nothing (final_color stays black).
     }
 
-    // Gamma ~2 (sqrt)
-    imageStore(resultImage, pixel_coords, vec4(sqrt(final_color), 1.0));
+    // Gamma ~2 (sqrt). Stored as B, G, R, A so that the bytes read back on the CPU are, as a
+    // little-endian int, 0xAARRGGBB: exactly the layout of a Java TYPE_INT_RGB image.
+    vec3 display = sqrt(final_color);
+    imageStore(resultImage, pixel_coords, vec4(display.b, display.g, display.r, 1.0));
 }

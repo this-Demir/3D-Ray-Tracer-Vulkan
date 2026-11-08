@@ -44,7 +44,7 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 | ~49k triangles | 29 ms | 0.6 ms |
 | ~1M triangles (20 instanced meshes) | 1129 ms | 0.7 ms |
 
-Building the acceleration structures for the default scene takes about 17 ms on the GPU (the CPU BVH took 0.4 s). The frame rate (~120 FPS) is currently limited by copying each frame back to the CPU for the Swing window, not by ray tracing.
+Building the acceleration structures for the default scene takes about 17 ms on the GPU (the CPU BVH took 0.4 s). With two frames in flight the renderer produces about 2000 frames per second on the default scene; the window shows the newest one at the monitor's refresh rate, and the extra frames go into accumulation. The window title shows render FPS, GPU time per frame (from timestamp queries), display FPS and accumulated samples.
 
 ##  Architecture Overview
 
