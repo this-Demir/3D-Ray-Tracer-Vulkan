@@ -43,6 +43,15 @@ layout(std140, set = 0, binding = 3) uniform FrameUBO {
     float exposure;          // stops (EV)
     float time;              // seconds, for animation
 } frame;
+layout(rgba32f, set = 0, binding = 4) uniform restrict image2D accumImage; // running average (linear)
+
+struct Light {               // 48 bytes, written by RayTracingScene.writeLights
+    vec4 centerRadius;       // emissive sphere: world center, radius
+    vec4 emission;           // rgb = emitted radiance
+    uint instance;           // its instance index, to recognize it in shadow rays
+    uint pad0, pad1, pad2;
+};
+layout(std430, set = 0, binding = 5) readonly buffer LightBuffer { Light lights[]; };
 
 // --- Constants ---
 const float T_MIN = 0.001;
@@ -208,6 +217,61 @@ bool scatter(vec3 inDir, Hit hit, InstanceInfo material, out vec3 attenuation, o
     return false; // emissive surfaces do not scatter
 }
 
+// --- Direct light from emissive spheres (next-event estimation) ---
+
+// Orthonormal basis around n (Duff et al. 2017).
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float c = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = vec3(c, s + n.y * n.y * a, -n.y);
+}
+
+// Light arriving at a diffuse point p (normal n) from one randomly chosen sphere light,
+// already divided by the sampling pdf: sample a direction in the cone the sphere subtends,
+// then cast a shadow ray. This is what makes small bright lights (a sun) converge quickly,
+// and what makes a planet cast its shadow in an eclipse.
+vec3 sampleSphereLight(vec3 p, vec3 n) {
+    uint index = min(uint(randomFloat() * float(frame.lightCount)), frame.lightCount - 1u);
+    Light light = lights[index];
+    vec3 toCenter = light.centerRadius.xyz - p;
+    float dist2 = dot(toCenter, toCenter);
+    float radius2 = light.centerRadius.w * light.centerRadius.w;
+    if (dist2 <= radius2) return vec3(0.0); // inside the light
+
+    float cosThetaMax = sqrt(max(0.0, 1.0 - radius2 / dist2));
+    float cosTheta = 1.0 - randomFloat() * (1.0 - cosThetaMax);
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * randomFloat();
+    vec3 w = toCenter * inversesqrt(dist2);
+    vec3 t, b;
+    basis(w, t, b);
+    vec3 dir = normalize(t * (cos(phi) * sinTheta) + b * (sin(phi) * sinTheta) + w * cosTheta);
+
+    float cosSurface = dot(dir, n);
+    if (cosSurface <= 0.0) return vec3(0.0);
+
+    Hit shadowHit;
+    if (!traceRay(Ray(p, dir), T_MAX, shadowHit) || shadowHit.instance != light.instance) {
+        return vec3(0.0); // something blocks the light
+    }
+    float pdf = 1.0 / (2.0 * PI * (1.0 - cosThetaMax)); // uniform over the cone's solid angle
+    // Diffuse BRDF (albedo / PI) is applied by the caller; one of lightCount lights was picked.
+    return light.emission.rgb * cosSurface / (PI * pdf) * float(frame.lightCount);
+}
+
+// Moves a ray origin off the surface to avoid hitting the same surface again (scale-aware).
+vec3 offsetOrigin(vec3 p, vec3 n, vec3 dir) {
+    float eps = 1e-4 * max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z))));
+    return p + (dot(dir, n) > 0.0 ? n : -n) * eps;
+}
+
+// ACES filmic tone curve (Narkowicz 2015): keeps bright lights from clipping harshly.
+vec3 acesFilm(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
 // --- Main ---
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
@@ -215,7 +279,8 @@ void main() {
     ivec2 imageSize = imageSize(resultImage);
     if (pixel.x >= imageSize.x || pixel.y >= imageSize.y) return;
 
-    seed = uint(pixel.y * imageSize.x + pixel.x);
+    // A different random sequence per pixel and per sample, so samples average out.
+    seed = pcg(uint(pixel.y * imageSize.x + pixel.x) ^ pcg(frame.sampleIndex * 0x9E3779B9u + 1u));
 
     // Anti-aliasing jitter, with the image flipped vertically
     float u = (float(pixel.x) + randomFloat()) / float(imageSize.x);
@@ -227,6 +292,7 @@ void main() {
 
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
+    bool lightSampledAtLastHit = false; // last bounce was diffuse and sampled the sphere lights
 
     for (uint bounce = 0u; bounce < frame.maxBounces; bounce++) {
         Hit hit;
@@ -236,8 +302,20 @@ void main() {
         }
         InstanceInfo material = instances[hit.instance];
         if (material.materialType == MAT_EMISSIVE) {
-            radiance += throughput * material.emissionIor.rgb;
+            // Sphere lights reached by a diffuse bounce were already counted by sampleSphereLight.
+            bool countedByLightSampling = lightSampledAtLastHit && material.geometryType == GEOMETRY_SPHERE;
+            if (!countedByLightSampling) {
+                radiance += throughput * material.emissionIor.rgb;
+            }
             break;
+        }
+
+        vec3 hitPos = r.origin + r.dir * hit.t;
+        lightSampledAtLastHit = false;
+        if (material.materialType == MAT_DIFFUSE && frame.lightCount > 0u) {
+            vec3 lightOrigin = offsetOrigin(hitPos, hit.normal, hit.normal);
+            radiance += throughput * material.albedoRoughness.rgb * sampleSphereLight(lightOrigin, hit.normal);
+            lightSampledAtLastHit = true;
         }
 
         vec3 attenuation;
@@ -246,12 +324,32 @@ void main() {
             break;
         }
         throughput *= attenuation;
-        r.origin = r.origin + r.dir * hit.t;
+
+        // Russian roulette: after a few bounces, end dim paths early without biasing the result.
+        if (bounce >= 3u) {
+            float survive = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.98);
+            if (randomFloat() > survive) break;
+            throughput /= survive;
+        }
+
+        r.origin = offsetOrigin(hitPos, hit.normal, nextDir);
         r.dir = nextDir;
     }
 
-    // Exposure, then gamma ~2 (sqrt). Stored as B, G, R, A so that the bytes read back on the
+    // Guard against NaN/Inf and rare extreme samples (fireflies) before averaging.
+    if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
+    radiance = min(radiance, vec3(100.0));
+
+    // Running average over all samples since the last change.
+    vec3 average = radiance;
+    if (frame.sampleIndex > 0u) {
+        vec3 previous = imageLoad(accumImage, pixel).rgb;
+        average = previous + (radiance - previous) / float(frame.sampleIndex + 1u);
+    }
+    imageStore(accumImage, pixel, vec4(average, 1.0));
+
+    // Exposure, tone mapping, gamma 2.2. Stored as B, G, R, A so that the bytes read back on the
     // CPU are, as a little-endian int, 0xAARRGGBB: exactly the layout of a Java TYPE_INT_RGB image.
-    vec3 display = sqrt(clamp(radiance * exp2(frame.exposure), 0.0, 1.0));
+    vec3 display = pow(acesFilm(average * exp2(frame.exposure)), vec3(1.0 / 2.2));
     imageStore(resultImage, pixel, vec4(display.b, display.g, display.r, 1.0));
 }

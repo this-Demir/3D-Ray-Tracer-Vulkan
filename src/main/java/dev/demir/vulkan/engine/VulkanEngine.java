@@ -71,6 +71,8 @@ public class VulkanEngine implements Runnable {
     private static final int BINDING_TLAS = 1;
     private static final int BINDING_INSTANCES = 2;
     private static final int BINDING_FRAME = 3;
+    private static final int BINDING_ACCUMULATION = 4;
+    private static final int BINDING_LIGHTS = 5;
 
     /** Per-frame-in-flight resources. */
     private static final class FrameSlot {
@@ -109,10 +111,13 @@ public class VulkanEngine implements Runnable {
     private int computeQueueFamilyIndex = -1;
     private GpuMemory gpuMemory;
 
-    // --- Render target ---
+    // --- Render target (RGBA8, displayed) and accumulation buffer (RGBA32F, running average) ---
     private long computeImage = VK_NULL_HANDLE;
     private long computeImageMemory = VK_NULL_HANDLE;
     private long computeImageView = VK_NULL_HANDLE;
+    private long accumImage = VK_NULL_HANDLE;
+    private long accumImageMemory = VK_NULL_HANDLE;
+    private long accumImageView = VK_NULL_HANDLE;
 
     // --- Pipeline Objects ---
     private long computeShaderModule = VK_NULL_HANDLE;
@@ -229,7 +234,15 @@ public class VulkanEngine implements Runnable {
             createDescriptorSetLayout(stack);
             createPipelineLayout(stack);
             createComputePipeline(stack);
-            createComputeImage(stack);
+            long[] output = createStorageImage(stack, VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            computeImage = output[0];
+            computeImageMemory = output[1];
+            computeImageView = output[2];
+            long[] accumulation = createStorageImage(stack, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+            accumImage = accumulation[0];
+            accumImageMemory = accumulation[1];
+            accumImageView = accumulation[2];
             createDescriptorPool(stack);
             createQueryPool(stack);
             for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
@@ -320,7 +333,7 @@ public class VulkanEngine implements Runnable {
         ubo.putInt(64, (int) sampleIndex);
         ubo.putInt(68, settings.maxBounces());
         ubo.putInt(72, settings.skyEnabled() ? 1 : 0);
-        ubo.putInt(76, 0); // light count (filled in once lights exist)
+        ubo.putInt(76, rtScene.lightCount());
         ubo.putFloat(80, settings.exposure());
         ubo.putFloat(84, 0f); // time
     }
@@ -349,6 +362,10 @@ public class VulkanEngine implements Runnable {
             imageBarrier(stack, cmd, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            // The previous frame's accumulation write must be visible to this frame's read-modify-write.
+            barrier(stack, cmd, accumImage, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
@@ -436,6 +453,11 @@ public class VulkanEngine implements Runnable {
 
     private void imageBarrier(MemoryStack stack, VkCommandBuffer cmd, int srcAccess, int dstAccess,
                               int oldLayout, int newLayout, int srcStage, int dstStage) {
+        barrier(stack, cmd, computeImage, srcAccess, dstAccess, oldLayout, newLayout, srcStage, dstStage);
+    }
+
+    private void barrier(MemoryStack stack, VkCommandBuffer cmd, long image, int srcAccess, int dstAccess,
+                         int oldLayout, int newLayout, int srcStage, int dstStage) {
         VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
                 .sType$Default()
                 .srcAccessMask(srcAccess)
@@ -444,7 +466,7 @@ public class VulkanEngine implements Runnable {
                 .newLayout(newLayout)
                 .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                 .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
-                .image(computeImage)
+                .image(image)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                         .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, null, null, barrier);
@@ -476,6 +498,9 @@ public class VulkanEngine implements Runnable {
         if (computeImageView != VK_NULL_HANDLE) vkDestroyImageView(device, computeImageView, null);
         if (computeImage != VK_NULL_HANDLE) vkDestroyImage(device, computeImage, null);
         if (computeImageMemory != VK_NULL_HANDLE) vkFreeMemory(device, computeImageMemory, null);
+        if (accumImageView != VK_NULL_HANDLE) vkDestroyImageView(device, accumImageView, null);
+        if (accumImage != VK_NULL_HANDLE) vkDestroyImage(device, accumImage, null);
+        if (accumImageMemory != VK_NULL_HANDLE) vkFreeMemory(device, accumImageMemory, null);
         if (gpuMemory != null) gpuMemory.destroy();
         if (device != null) vkDestroyDevice(device, null);
         if (debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
@@ -714,22 +739,22 @@ public class VulkanEngine implements Runnable {
 
     // --- Render target, frame slots, timing ---
 
-    /** The image the shader writes (storage) and each frame is copied from (transfer source). */
-    private void createComputeImage(MemoryStack stack) {
+    /** Creates a WIDTH x HEIGHT VRAM image the shader can read/write. Returns {image, memory, view}. */
+    private long[] createStorageImage(MemoryStack stack, int format, int usage) {
         VkImageCreateInfo imageInfo = VkImageCreateInfo.calloc(stack)
                 .sType$Default()
-                .imageType(VK_IMAGE_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM)
+                .imageType(VK_IMAGE_TYPE_2D).format(format)
                 .extent(e -> e.width(WIDTH).height(HEIGHT).depth(1))
                 .mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
                 .tiling(VK_IMAGE_TILING_OPTIMAL)
-                .usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                .usage(usage)
                 .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
         LongBuffer pImage = stack.mallocLong(1);
         check(vkCreateImage(device, imageInfo, null, pImage), "vkCreateImage");
-        computeImage = pImage.get(0);
+        long image = pImage.get(0);
 
         VkMemoryRequirements memRequirements = VkMemoryRequirements.malloc(stack);
-        vkGetImageMemoryRequirements(device, computeImage, memRequirements);
+        vkGetImageMemoryRequirements(device, image, memRequirements);
         VkMemoryAllocateInfo allocInfo = VkMemoryAllocateInfo.calloc(stack)
                 .sType$Default()
                 .allocationSize(memRequirements.size())
@@ -737,16 +762,16 @@ public class VulkanEngine implements Runnable {
                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0));
         LongBuffer pImageMemory = stack.mallocLong(1);
         check(vkAllocateMemory(device, allocInfo, null, pImageMemory), "vkAllocateMemory (image)");
-        computeImageMemory = pImageMemory.get(0);
-        vkBindImageMemory(device, computeImage, computeImageMemory, 0);
+        long memory = pImageMemory.get(0);
+        vkBindImageMemory(device, image, memory, 0);
 
         VkImageViewCreateInfo viewInfo = VkImageViewCreateInfo.calloc(stack)
                 .sType$Default()
-                .image(computeImage).viewType(VK_IMAGE_VIEW_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM)
+                .image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format)
                 .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         LongBuffer pImageView = stack.mallocLong(1);
         check(vkCreateImageView(device, viewInfo, null, pImageView), "vkCreateImageView");
-        computeImageView = pImageView.get(0);
+        return new long[]{image, memory, pImageView.get(0)};
     }
 
     private FrameSlot createFrameSlot(MemoryStack stack, int index) {
@@ -802,9 +827,11 @@ public class VulkanEngine implements Runnable {
     private void transitionImageToGeneral() {
         gpuMemory.submitAndWait(cmd -> {
             try (MemoryStack stack = stackPush()) {
-                imageBarrier(stack, cmd, 0, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                for (long image : new long[]{computeImage, accumImage}) {
+                    barrier(stack, cmd, image, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                }
             }
         });
     }
@@ -812,7 +839,7 @@ public class VulkanEngine implements Runnable {
     // --- Pipeline and descriptors ---
 
     private void createDescriptorSetLayout(MemoryStack stack) {
-        VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(4, stack);
+        VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(6, stack);
         bindings.get(0).binding(BINDING_IMAGE).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
         bindings.get(1).binding(BINDING_TLAS).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
@@ -820,6 +847,10 @@ public class VulkanEngine implements Runnable {
         bindings.get(2).binding(BINDING_INSTANCES).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
         bindings.get(3).binding(BINDING_FRAME).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+        bindings.get(4).binding(BINDING_ACCUMULATION).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+        bindings.get(5).binding(BINDING_LIGHTS).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
 
         VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
@@ -861,9 +892,9 @@ public class VulkanEngine implements Runnable {
 
     private void createDescriptorPool(MemoryStack stack) {
         VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(4, stack);
-        poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(FRAMES_IN_FLIGHT);
+        poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2 * FRAMES_IN_FLIGHT);
         poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(FRAMES_IN_FLIGHT);
-        poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(FRAMES_IN_FLIGHT);
+        poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(2 * FRAMES_IN_FLIGHT);
         poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(FRAMES_IN_FLIGHT);
 
         VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
@@ -887,8 +918,17 @@ public class VulkanEngine implements Runnable {
                 .buffer(rtScene.instanceInfoBuffer().buffer()).offset(0).range(VK_WHOLE_SIZE);
         VkDescriptorBufferInfo.Buffer frameInfo = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(slot.frameUbo.buffer()).offset(0).range(VK_WHOLE_SIZE);
+        VkDescriptorImageInfo.Buffer accumInfo = VkDescriptorImageInfo.calloc(1, stack)
+                .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
+                .imageView(accumImageView);
+        VkDescriptorBufferInfo.Buffer lightInfo = VkDescriptorBufferInfo.calloc(1, stack)
+                .buffer(rtScene.lightBuffer().buffer()).offset(0).range(VK_WHOLE_SIZE);
 
-        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(4, stack);
+        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(6, stack);
+        writes.get(4).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_ACCUMULATION)
+                .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).pImageInfo(accumInfo);
+        writes.get(5).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_LIGHTS)
+                .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).pBufferInfo(lightInfo);
         writes.get(0).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_IMAGE)
                 .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).pImageInfo(imageInfo);
         writes.get(1).sType$Default().pNext(tlasInfo.address()).dstSet(slot.descriptorSet).dstBinding(BINDING_TLAS)

@@ -61,10 +61,15 @@ public final class RayTracingScene {
     private final GpuMemory memory;
     private final long scratchAlignment;
 
+    /** Bytes per entry in the light buffer; must match Light in pathtrace.comp. */
+    public static final int LIGHT_SIZE = 48;
+
     private final Map<String, GpuGeometry> geometries = new HashMap<>();
     private AccelerationStructure tlas;
     private GpuBuffer tlasInstances; // VkAccelerationStructureInstanceKHR[] read by the TLAS build
     private GpuBuffer instanceInfo;  // InstanceInfo[] read by the shader
+    private GpuBuffer lights;        // Light[]: emissive spheres, sampled directly with shadow rays
+    private int lightCount;
 
     public RayTracingScene(VkDevice device, GpuMemory memory) {
         this.device = device;
@@ -121,6 +126,15 @@ public final class RayTracingScene {
 
     public GpuBuffer instanceInfoBuffer() {
         return instanceInfo;
+    }
+
+    public GpuBuffer lightBuffer() {
+        return lights;
+    }
+
+    /** Number of emissive spheres the shader samples directly. */
+    public int lightCount() {
+        return lightCount;
     }
 
     public void destroy() {
@@ -242,6 +256,7 @@ public final class RayTracingScene {
 
             writeInstanceInfo(info, i * INSTANCE_INFO_SIZE, geometry, instance.material());
         }
+        writeLights(scene, hostVisible);
 
         try (MemoryStack stack = stackPush()) {
             VkAccelerationStructureGeometryKHR.Buffer geometry = VkAccelerationStructureGeometryKHR.calloc(1, stack);
@@ -283,6 +298,48 @@ public final class RayTracingScene {
         info.putInt(base + 60, 0);
     }
 
+    /**
+     * Light layout (std430, 48 bytes):
+     *   0  vec4 center.xyz, radius      16 vec4 emission.rgb, unused
+     *  32  uint instance (to recognize the light in a shadow ray)   36..47 padding
+     * Only spheres become lights; emissive meshes still glow when a ray hits them.
+     */
+    private void writeLights(SceneDescription scene, int hostVisible) {
+        int count = 0;
+        for (SceneDescription.Instance instance : scene.instances()) {
+            if (isSphereLight(instance)) count++;
+        }
+        lightCount = count;
+        lights = memory.createBuffer((long) Math.max(1, count) * LIGHT_SIZE,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVisible, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        ByteBuffer data = lights.mapped();
+        int light = 0;
+        for (int i = 0; i < scene.instances().size(); i++) {
+            SceneDescription.Instance instance = scene.instances().get(i);
+            if (!isSphereLight(instance)) continue;
+            float[] m = instance.transform();
+            float radius = 0f; // largest axis scale (spheres are expected to be scaled uniformly)
+            for (int col = 0; col < 3; col++) {
+                radius = Math.max(radius, (float) Math.sqrt(m[col] * m[col] + m[4 + col] * m[4 + col] + m[8 + col] * m[8 + col]));
+            }
+            Material material = instance.material();
+            int base = light * LIGHT_SIZE;
+            data.putFloat(base, m[3]).putFloat(base + 4, m[7]).putFloat(base + 8, m[11]).putFloat(base + 12, radius);
+            data.putFloat(base + 16, material.albedo()[0] * material.emission());
+            data.putFloat(base + 20, material.albedo()[1] * material.emission());
+            data.putFloat(base + 24, material.albedo()[2] * material.emission());
+            data.putFloat(base + 28, 0f);
+            data.putInt(base + 32, i);
+            light++;
+        }
+    }
+
+    private static boolean isSphereLight(SceneDescription.Instance instance) {
+        return instance.geometry() instanceof SphereGeometry
+                && instance.material().type() == Material.Type.EMISSIVE
+                && instance.material().emission() > 0f;
+    }
+
     private void destroyTopLevel() {
         if (tlas != null) {
             destroy(tlas);
@@ -290,8 +347,11 @@ public final class RayTracingScene {
         }
         memory.destroy(tlasInstances);
         memory.destroy(instanceInfo);
+        memory.destroy(lights);
         tlasInstances = null;
         instanceInfo = null;
+        lights = null;
+        lightCount = 0;
     }
 
     // --- Shared build code ---

@@ -10,7 +10,8 @@ package dev.demir.vulkan.engine;
  */
 public record RenderSettings(boolean skyEnabled, float exposure, int maxBounces, int maxSamples) {
 
-    public static final RenderSettings DEFAULT = new RenderSettings(true, 0f, 10, 0);
+    /** Stops after 8192 samples: the image has converged and the GPU can rest. */
+    public static final RenderSettings DEFAULT = new RenderSettings(true, 0f, 10, 8192);
 
     public RenderSettings withSky(boolean sky) {
         return new RenderSettings(sky, exposure, maxBounces, maxSamples);
