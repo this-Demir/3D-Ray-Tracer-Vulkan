@@ -8,9 +8,9 @@ import java.util.List;
  * Immutable snapshot of the scene, handed from the UI / scene rebuild thread to the
  * Vulkan render thread. Holds no Vulkan objects. Object transforms are evaluated for a
  * point in time with {@link #transformsAt(double)}, which applies the animations.
- * blackHole is null for scenes without one.
+ * compactObject (black hole or neutron star) is null for scenes without one.
  */
-public record SceneDescription(List<Instance> instances, BlackHole blackHole) {
+public record SceneDescription(List<Instance> instances, CompactObject compactObject) {
 
     /** Orbit parent values besides an instance index. */
     public static final int NO_ORBIT = -1;

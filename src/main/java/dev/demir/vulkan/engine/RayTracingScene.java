@@ -136,9 +136,9 @@ public final class RayTracingScene {
         return scene != null && scene.isAnimated();
     }
 
-    /** The scene's black hole, or null. */
-    public dev.demir.vulkan.scene.BlackHole blackHole() {
-        return scene == null ? null : scene.blackHole();
+    /** The scene's black hole or neutron star, or null. */
+    public dev.demir.vulkan.scene.CompactObject compactObject() {
+        return scene == null ? null : scene.compactObject();
     }
 
     /**

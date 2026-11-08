@@ -23,6 +23,7 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 * **Path Tracing:** Progressive accumulation (the image keeps refining until a sample limit), materials **Matte**, **Metal** (roughness 0 = mirror), **Glass** (refraction, Fresnel) and **Light** (emissive), direct light sampling with shadow rays towards spherical lights, Russian roulette, ACES tone mapping and exposure.
 * **Animation:** Objects can orbit other objects (or the origin) and spin; orbits nest (a moon around a planet around a sun). The TLAS is rebuilt on the GPU inside every frame.
 * **Black Hole:** Camera rays follow exact Schwarzschild light paths (RK4 integration, each step traced as a ray query), with a relativistic accretion disk (gravitational and Doppler shift, g⁴ beaming). Verified against known results: the rendered shadow is 171.0 px for a predicted 171.4 px.
+* **Neutron Star:** The same light paths ending on a glowing, spinning surface with gravitational redshift; diagnostic colouring of the regions only bent light can show, a split view (straight vs bent) and pulsar beams. The rendered star measures 234.8 px for a predicted 234.6 px (194.9 px without gravity).
 * **Multi-Threaded Architecture:**
     * **UI Thread:** Responsive Swing Interface (never freezes).
     * **Vulkan Render Thread (VRT):** Dedicated rendering loop with two frames in flight; the only thread that makes Vulkan calls.
@@ -41,6 +42,9 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 | **Black Hole** | **Black Hole without gravity** |
 | ![Black Hole](render_images/rt/black-hole.jpg) | ![No gravity](render_images/rt/black-hole-no-gravity.jpg) |
 | Light bent around a Schwarzschild black hole: the far side of the accretion disk shows above and below the shadow, a planet hidden behind the hole appears as Einstein arcs, the approaching side of the disk is brighter (Doppler beaming). See [docs/black-hole.md](docs/black-hole.md) for the physics and its verification. | The same scene with straight light rays, for comparison: the horizon is a black sphere and the planet behind it is hidden. |
+| **Neutron Star** | **Neutron Star, split view** |
+| ![Neutron Star](render_images/rt/neutron-star.jpg) | ![Split view](render_images/rt/neutron-star-split.jpg) |
+| A spinning neutron star (1.4 solar masses, 12 km) with hot spots and pulsar beams. Bent light shows 75.5 % of its surface instead of half; the orange parts are those straight light could never show. See [docs/neutron-star.md](docs/neutron-star.md). | Left half straight light, right half bent light: the star looks 20 % larger, redshifted, and shows its far side. |
 
 ##  System & Performance
 
@@ -66,6 +70,7 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 | Eclipse (animated) | 0.4 ms | TLAS rebuilt every frame |
 | ShowRoom (animated) | 0.5 ms | ~205k triangles |
 | Black Hole | 14 ms | every camera ray integrated around the black hole (~70 frames per second) |
+| Neutron Star | 15 ms | every camera ray integrated past the star (~67 frames per second) |
 
 Building the acceleration structures for the default scene takes about 17 ms on the GPU (the CPU BVH took 0.4 s). With two frames in flight the renderer produces about 2000 frames per second on the default scene; the window shows the newest one at the monitor's refresh rate, and the extra frames go into accumulation. The window title shows render FPS, GPU time per frame (from timestamp queries), display FPS and accumulated samples.
 
@@ -98,7 +103,7 @@ graph TD
 * **W / S, A / D, Q / E:** Move forward / back, left / right, up / down (camera and target together)
 
 ### Side Panel
-* **Scene:** Load a preset (Custom, Mirror Room, Eclipse, ShowRoom, Black Hole, Black Hole: Shadow); sky light, maximum bounces, exposure, sample limit (rendering stops when reached, 0 = never), *Play animation* and *Gravity bends light* (black hole scenes).
+* **Scene:** Load a preset (Custom, Mirror Room, Eclipse, ShowRoom, Black Hole, Black Hole: Shadow, Neutron Star); sky light, maximum bounces, exposure, sample limit (rendering stops when reached, 0 = never), *Play animation*, and for black hole and neutron star scenes *Gravity bends light*, *Split view* (left half straight light) and *Pulsar beams*.
 * **Object pool:** The sphere primitive and the models in `objects/`. *Add* (or double-click) places one where the camera looks; *Browse...* adds any `.obj` file.
 * **Objects:** The objects in the scene, with *Duplicate* and *Remove*.
 * **Object settings:** Name, position, rotation, scale, material (color, roughness, light brightness, index of refraction) and animation (orbit center, orbit period, spin period) of the selected object.
@@ -112,7 +117,8 @@ graph TD
 * **Frame Pipeline:** Two frames in flight; the shader writes BGRA so the frame copied back from cached host memory goes straight into a `TYPE_INT_RGB` image; GPU time is measured with timestamp queries. Animation time advances in 1/60 s steps, so frames rendered within one step still accumulate.
 * **Synchronization:** Explicit memory barriers and layout transitions (General <-> Transfer) between the compute pass and the copy of the frame to the CPU.
 * **Black Hole:** camera rays are integrated along exact Schwarzschild light paths (RK4, one ray query per step) with a relativistic accretion disk; derivations and measurements in [docs/black-hole.md](docs/black-hole.md).
-* **Tests:** JUnit 5 tests check the black hole integrator (a CPU copy of the shader math) against exact results: the light path against the exact orbit integral, the photon sphere, the capture threshold, the shadow size and the weak-field deflection.
+* **Neutron Star:** the same ray march ends on the star's surface sphere (exact chord intersection); surface light is redshifted by g = √(1 - 2M/R); details in [docs/neutron-star.md](docs/neutron-star.md).
+* **Tests:** JUnit 5 tests check the light-bending integrator (a CPU copy of the shader math) against exact results: the light path against the exact orbit integral, the photon sphere, the capture threshold, the black hole shadow size, the weak-field deflection, and the visible surface and apparent size of a neutron star.
 
 ##  Build & Run
 

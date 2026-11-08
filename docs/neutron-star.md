@@ -5,6 +5,10 @@ by its gravity on the way to the camera. The **Neutron Star** scene uses the sam
 paths as the black hole (see [black-hole.md](black-hole.md)); the difference is that rays can end on a
 glowing surface. Units: G = c = 1, mass M.
 
+| Bent light, with pulsar beams | Split view: straight light (left) and bent light (right) |
+|---|---|
+| ![Neutron star](../render_images/rt/neutron-star.jpg) | ![Split view](../render_images/rt/neutron-star-split.jpg) |
+
 ## 1. Physics
 
 A typical neutron star has 1.4 solar masses and a radius of about 12 km. In units of M = GM/c² ≈ 2.07 km
@@ -65,24 +69,49 @@ deliberately diagnostic:
 | Light bending, apparent size, lensed star field | physical | exact ray marching |
 | Gravitational redshift of the surface (g⁴ brightness, g · temperature) | physical | uniform dimming / reddening |
 | Hot spots at the magnetic poles, black-body colour | physical model, simplified | the classic pulsar picture |
-| **Near / far side colouring** of the surface (cool blue facing the camera, warm orange facing away) with a latitude–longitude grid | diagnostic | every orange pixel is a part of the star that straight light could never show |
+| **Hidden-region colouring** of the surface: orange where straight light from the camera can never reach (n · toCamera < R / distance), blue elsewhere, with a latitude–longitude grid | diagnostic | every orange pixel is a part of the star that only bent light shows |
 | **Split view**: left half straight light, right half bent light, same frame | diagnostic | direct comparison without toggling |
 | Pulsar beams: glowing cones along the magnetic axis | artistic | shows where the radiation goes; the glow is sampled along the bent ray, so the beams look bent near the star |
 
 The star spins with *Play animation*, so the hot spots move to the far side and stay visible.
 
-## 3. Implementation plan
+## 3. Implementation
 
-- One general ray march for compact objects (replaces the black hole's separate straight-ray path):
-  integrate with gravity on, or march the same steps without acceleration when gravity is off.
-- Per step, besides the scene geometry and the disk, intersect the chord with the star's surface sphere
-  (radius R; for a black hole without gravity, the horizon 2M). The photon-sphere capture rule is only
-  used for a black hole with gravity.
-- Frame UBO grows by one vec4: surface radius, spin period, magnetic tilt, display flags (split view, beams).
-- Tests: the integrator's ψ_max and apparent size against the exact values above.
-- GPU check: measure the star's radius in the render (on and off), and count far-side pixels
-  (none expected without gravity).
+- `marchCompactObject` in `pathtrace.comp` handles both black holes and neutron stars: with gravity it
+  integrates the light path (RK4, as for the black hole), without gravity it takes the same steps along a
+  straight line. Each chord is checked against the star's surface sphere (for a black hole without gravity,
+  the horizon sphere 2M), the accretion disk and the scene geometry (ray query). The photon-sphere capture
+  rule is only used for a black hole with gravity.
+- The scene data is a `CompactObject` (black hole: surface radius 0; neutron star: radius, spin period,
+  magnetic tilt). The frame UBO carries it in three vec4s, plus the display flags.
+- *Split view* and *Pulsar beams* are switches in the Scene panel; the star spins with *Play animation*.
 
 ## 4. Verification
 
-*(Filled in after implementation.)*
+`NeutronStarTest` (`./gradlew test`), M = 1:
+
+| Check | Integrator | Exact |
+|---|---|---|
+| ψ for R = 5.8M, α = 90° (farthest visible point) | 120.67482° | 120.67482° |
+| ψ for R = 8M, 12M (α = 45° and 90°) | all equal to 5 decimals | quadrature |
+| Visible surface for R = 5.8M | 75.5 % | 75.5 % |
+| Apparent angular radius from 30M | 13.34177° | 13.34141° (formula) |
+| Same without gravity | 11.14738° | asin(R/r) = 11.14738° |
+
+On the GPU (scene **Neutron Star**, animation and beams off, camera at 30M, 40° vertical field of view),
+radius measured from the image center in four directions with sub-pixel edge detection:
+
+| | Rendered | Theory |
+|---|---|---|
+| Radius with gravity | **234.8 px** (234.7 … 234.8) | 234.6 px |
+| Radius without gravity | **194.9 px** (194.9 … 195.0) | 194.9 px |
+| Pixels showing the hidden region (orange) | 16 001 with gravity, **0** without | 0 without gravity |
+
+Performance on an RTX 5060 Ti: about 15 ms GPU time per frame (~67 frames per second).
+
+## Limits
+
+- The star is treated as static spacetime (Schwarzschild); its rotation only moves the surface pattern
+  (no frame dragging, no Doppler shift from the spinning surface, no oblate shape).
+- The pulse profile table above is computed, not measured from the render (no light curve plot yet).
+- Bounced and shadow rays are straight, as in the black hole scene.

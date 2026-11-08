@@ -44,6 +44,8 @@ layout(std140, set = 0, binding = 3) uniform FrameUBO {
     float time;              // seconds, for animation
     vec4  blackHole;         // xyz = position, w = mass M (0 = no black hole)
     vec4  blackHoleDisk;     // x = inner radius, y = outer radius, z = brightness, w = gravity on (1) / off (0)
+    vec4  compactSurface;    // x = surface radius (0 = black hole), y = spin period, z = magnetic tilt (rad),
+                             // w = flags: 1 split view, 2 pulsar beams
 } frame;
 layout(rgba32f, set = 0, binding = 4) uniform restrict image2D accumImage; // running average (linear)
 
@@ -346,51 +348,130 @@ bool segmentHitsGeometry(vec3 origin, vec3 dir, float len) {
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-// Bends a camera ray around the black hole by integrating
-//   dx/dλ = v,  dv/dλ = -3 M h² x / r⁵,  h = |x × v|   (exact Schwarzschild light paths, RK4).
-// Each step is a straight chord traced with a ray query, so the scene's objects are found by the
-// RT cores as usual. On return, (r, tMax) is the straight segment the caller traces next:
-//   NONE    -> geometry lies on that segment (or the ray escaped: tMax = T_MAX)
+const int BH_EVENT_SURFACE = 3;      // the ray ends on the neutron star's surface; 'emitted' is its light
+
+const vec3 BEAM_COLOR = vec3(0.55, 0.75, 1.0);
+
+// Rotates v around +y by angle a.
+vec3 rotateY(vec3 v, float a) {
+    float c = cos(a), s = sin(a);
+    return vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+}
+
+// Neutron star surface seen at point p (relative to the star). Physical: black-body hot spots at the
+// magnetic poles and the gravitational redshift g = √(1 - 2M/R) (temperature × g, brightness × g⁴).
+// Diagnostic: a latitude-longitude grid, and orange for every point that straight light from the camera
+// can never reach (dot(n, toCamera) < R / distance), blue for the rest.
+vec3 surfaceEmission(vec3 p, bool gravity) {
+    float M = frame.blackHole.w;
+    float R = frame.compactSurface.x;
+    vec3 n = normalize(p);
+
+    float spin = frame.compactSurface.y != 0.0 ? 6.28318530718 * frame.time / frame.compactSurface.y : 0.0;
+    vec3 ns = rotateY(n, -spin);                                   // in the star's rotating frame
+    float tilt = frame.compactSurface.z;
+    vec3 magneticAxis = vec3(sin(tilt), cos(tilt), 0.0);
+
+    vec3 toCamera = frame.origin.xyz - frame.blackHole.xyz;
+    float cameraDistance = length(toCamera);
+    bool hiddenToStraightLight = dot(n, toCamera / cameraDistance) < R / cameraDistance;
+    vec3 base = hiddenToStraightLight ? vec3(1.0, 0.42, 0.1) : vec3(0.22, 0.45, 1.0);
+
+    float latitude = degrees(asin(clamp(ns.y, -1.0, 1.0)));
+    float longitude = degrees(atan(ns.z, ns.x));
+    float toLatLine = abs(fract(latitude / 15.0 + 0.5) - 0.5) * 15.0;
+    float toLonLine = abs(fract(longitude / 15.0 + 0.5) - 0.5) * 15.0 * cos(radians(latitude));
+    float line = 1.0 - smoothstep(0.5, 1.1, min(toLatLine, toLonLine));
+    vec3 radiance = base * (0.9 - 0.6 * line) * 0.6;
+
+    float g = gravity ? sqrt(1.0 - 2.0 * M / R) : 1.0;
+    float spot = smoothstep(cos(radians(17.0)), cos(radians(11.0)), abs(dot(ns, magneticAxis)));
+    radiance += spot * blackbody(11000.0 * g) * 3.0;
+    return radiance * pow(g, 4.0);
+}
+
+// Glow of the pulsar beams (artistic): cones of about 10° around the magnetic axis, fading with distance.
+vec3 beamGlow(vec3 q, float len) {
+    float R = frame.compactSurface.x;
+    float r = length(q);
+    if (r <= R) return vec3(0.0);
+    float spin = frame.compactSurface.y != 0.0 ? 6.28318530718 * frame.time / frame.compactSurface.y : 0.0;
+    float tilt = frame.compactSurface.z;
+    vec3 magneticAxis = rotateY(vec3(sin(tilt), cos(tilt), 0.0), spin);
+    float alignment = abs(dot(q / r, magneticAxis));
+    float cone = smoothstep(cos(radians(12.0)), cos(radians(4.0)), alignment);
+    return BEAM_COLOR * (0.04 * cone * len * exp(-(r - R) / (5.0 * R)));
+}
+
+// Follows a camera ray past a compact object (black hole or neutron star). With gravity the ray is
+// integrated along the exact Schwarzschild light path
+//   dx/dλ = v,  dv/dλ = -3 M h² x / r⁵,  h = |x × v|   (RK4, dλ = 0.02 r)
+// and without gravity the same steps are taken along a straight line. Each step's chord is checked
+// against the surface (neutron star; for a black hole without gravity the horizon sphere), the accretion
+// disk and the scene geometry (ray query). On return, (r, tMax) is the straight segment the caller traces next:
+//   NONE    -> geometry lies on that segment (or the ray left the region: tMax = T_MAX)
 //   DISK    -> the segment ends on the disk, no geometry before it; 'emitted' is the disk light
-//   HORIZON -> captured (black)
-int marchBlackHole(inout Ray r, out float tMax, out vec3 emitted) {
+//   SURFACE -> the segment ends on the neutron star, no geometry before it; 'emitted' is its light
+//   HORIZON -> the ray falls into the black hole (black)
+// 'glow' collects the pulsar beam light along the way.
+int marchCompactObject(inout Ray r, bool gravity, out float tMax, out vec3 emitted, out vec3 glow) {
     vec3 center = frame.blackHole.xyz;
     float M = frame.blackHole.w;
+    float accel = gravity ? M : 0.0;
+    bool blackHole = frame.compactSurface.x == 0.0;
+    float surfaceRadius = blackHole ? (gravity ? 0.0 : 2.0 * M) : frame.compactSurface.x;
     bool disk = frame.blackHoleDisk.z > 0.0;
+    bool beams = !blackHole && (int(frame.compactSurface.w) & 2) != 0;
     emitted = vec3(0.0);
+    glow = vec3(0.0);
     tMax = T_MAX;
 
     vec3 x = r.origin - center;
     float radius = length(x);
     // Direction seen by the (static) camera -> integration velocity: radial part scaled by √(1 - 2M/r).
     vec3 radialDir = x / radius;
-    vec3 v = r.dir - (1.0 - sqrt(max(1.0 - 2.0 * M / radius, 0.0))) * dot(r.dir, radialDir) * radialDir;
+    vec3 v = r.dir;
+    if (gravity) v -= (1.0 - sqrt(max(1.0 - 2.0 * M / radius, 0.0))) * dot(r.dir, radialDir) * radialDir;
     vec3 hv = cross(x, v);
     float h2 = dot(hv, hv);
 
     for (int i = 0; i < BH_MAX_STEPS; i++) {
         radius = length(x);
         float outward = dot(x, v);
-        if (radius < 3.0 * M && outward < 0.0) return BH_EVENT_HORIZON; // inside the photon sphere, falling in
+        if (gravity && blackHole && radius < 3.0 * M && outward < 0.0) {
+            return BH_EVENT_HORIZON; // inside the photon sphere, falling in
+        }
         if (radius > BH_ESCAPE * M && outward > 0.0) {
             r.origin = x + center;
             r.dir = normalize(v);
-            return BH_EVENT_NONE;                                        // far away: straight from here
+            return BH_EVENT_NONE;    // far away: straight from here
         }
 
-        // One RK4 step of length dl.
+        // One RK4 step of length dl (zero acceleration without gravity).
         float dl = BH_STEP_FACTOR * radius;
         vec3 x0 = x;
-        vec3 k1x = v;                       vec3 k1v = -3.0 * M * h2 * x / pow(dot(x, x), 2.5);
-        vec3 x2 = x + 0.5 * dl * k1x;       vec3 k2x = v + 0.5 * dl * k1v;  vec3 k2v = -3.0 * M * h2 * x2 / pow(dot(x2, x2), 2.5);
-        vec3 x3 = x + 0.5 * dl * k2x;       vec3 k3x = v + 0.5 * dl * k2v;  vec3 k3v = -3.0 * M * h2 * x3 / pow(dot(x3, x3), 2.5);
-        vec3 x4 = x + dl * k3x;             vec3 k4x = v + dl * k3v;        vec3 k4v = -3.0 * M * h2 * x4 / pow(dot(x4, x4), 2.5);
+        vec3 k1x = v;                       vec3 k1v = -3.0 * accel * h2 * x / pow(dot(x, x), 2.5);
+        vec3 x2 = x + 0.5 * dl * k1x;       vec3 k2x = v + 0.5 * dl * k1v;  vec3 k2v = -3.0 * accel * h2 * x2 / pow(dot(x2, x2), 2.5);
+        vec3 x3 = x + 0.5 * dl * k2x;       vec3 k3x = v + 0.5 * dl * k2v;  vec3 k3v = -3.0 * accel * h2 * x3 / pow(dot(x3, x3), 2.5);
+        vec3 x4 = x + dl * k3x;             vec3 k4x = v + dl * k3v;        vec3 k4v = -3.0 * accel * h2 * x4 / pow(dot(x4, x4), 2.5);
         x += dl / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
         v += dl / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
 
         vec3 chord = x - x0;
         float chordLength = length(chord);
         vec3 chordDir = chord / chordLength;
+
+        // Surface sphere: first crossing along the chord.
+        float surfaceT = -1.0;
+        if (surfaceRadius > 0.0) {
+            float b = dot(x0, chordDir);
+            float c = dot(x0, x0) - surfaceRadius * surfaceRadius;
+            float discriminant = b * b - c;
+            if (discriminant >= 0.0) {
+                float t = -b - sqrt(discriminant);
+                if (t >= 0.0 && t <= chordLength) surfaceT = t;
+            }
+        }
 
         // Disk: the chord crosses the y = 0 plane between the inner and outer radius.
         float diskT = -1.0;
@@ -404,49 +485,35 @@ int marchBlackHole(inout Ray r, out float tMax, out vec3 emitted) {
             }
         }
 
-        float segmentEnd = diskT >= 0.0 ? diskT : chordLength;
+        float segmentEnd = chordLength;
+        if (surfaceT >= 0.0) segmentEnd = surfaceT;
+        if (diskT >= 0.0 && diskT < segmentEnd) segmentEnd = diskT;
+
+        if (beams) glow += beamGlow(x0 + 0.5 * segmentEnd * chordDir, segmentEnd);
+
         if (segmentHitsGeometry(x0 + center, chordDir, segmentEnd)) {
             r.origin = x0 + center;
             r.dir = chordDir;
             tMax = segmentEnd * 1.0001 + T_MIN;
             return BH_EVENT_NONE;
         }
+        if (surfaceT >= 0.0 && (diskT < 0.0 || surfaceT <= diskT)) {
+            r.origin = x0 + center;
+            r.dir = chordDir;
+            tMax = max(surfaceT, T_MIN * 2.0);
+            if (blackHole) return BH_EVENT_HORIZON;          // straight light into the horizon sphere
+            emitted = surfaceEmission(x0 + surfaceT * chordDir, gravity);
+            return BH_EVENT_SURFACE;
+        }
         if (diskT >= 0.0) {
             r.origin = x0 + center;
             r.dir = chordDir;
             tMax = max(diskT, T_MIN * 2.0);
-            emitted = diskEmission(diskPoint, v, h2, true);
+            emitted = diskEmission(diskPoint, v, h2, gravity);
             return BH_EVENT_DISK;
         }
     }
-    return BH_EVENT_HORIZON;
-}
-
-// Without gravity: the ray stays straight; the horizon is an opaque black sphere and the disk a flat ring.
-int straightBlackHole(Ray r, out float tMax, out vec3 emitted) {
-    vec3 center = frame.blackHole.xyz;
-    float M = frame.blackHole.w;
-    emitted = vec3(0.0);
-    tMax = T_MAX;
-    int event = BH_EVENT_NONE;
-
-    vec3 oc = (r.origin - center) / (2.0 * M);                    // horizon = sphere of radius 2M
-    float tHorizon = intersectUnitSphere(oc, r.dir / (2.0 * M), T_MIN, T_MAX);
-    if (tHorizon > 0.0) {
-        tMax = tHorizon;
-        event = BH_EVENT_HORIZON;
-    }
-    if (frame.blackHoleDisk.z > 0.0 && abs(r.dir.y) > 1e-6) {
-        float tDisk = (center.y - r.origin.y) / r.dir.y;
-        vec3 p = r.origin + tDisk * r.dir - center;
-        float pr = length(p);
-        if (tDisk > T_MIN && tDisk < tMax && pr >= frame.blackHoleDisk.x && pr <= frame.blackHoleDisk.y) {
-            tMax = tDisk;
-            event = BH_EVENT_DISK;
-            emitted = diskEmission(p, r.dir, 0.0, false);
-        }
-    }
-    return event;
+    return blackHole ? BH_EVENT_HORIZON : BH_EVENT_NONE;
 }
 
 // --- Main ---
@@ -471,26 +538,29 @@ void main() {
     vec3 throughput = vec3(1.0);
     bool lightSampledAtLastHit = false; // last bounce was diffuse and sampled the sphere lights
 
-    // Black hole scenes: the camera ray is bent first (or, with gravity off, checked against the
-    // horizon and disk); the bounce loop then continues with the resulting straight segment.
+    // Black hole / neutron star scenes: the camera ray first follows its path past the compact object
+    // (bent, or straight with gravity off); the bounce loop then continues with the resulting straight
+    // segment. In split view the left half of the image always uses straight light.
     float firstTMax = T_MAX;
-    int firstEvent = BH_EVENT_NONE;
-    vec3 firstEmission = vec3(0.0);
     uint bounces = frame.maxBounces;
+    bool splitView = (int(frame.compactSurface.w) & 1) != 0;
     if (frame.blackHole.w > 0.0) {
-        firstEvent = frame.blackHoleDisk.w > 0.5 ? marchBlackHole(r, firstTMax, firstEmission)
-                                                 : straightBlackHole(r, firstTMax, firstEmission);
-        if (firstEvent == BH_EVENT_HORIZON && frame.blackHoleDisk.w > 0.5) bounces = 0u; // captured
+        bool gravity = frame.blackHoleDisk.w > 0.5 && !(splitView && pixel.x < imageSize.x / 2);
+        vec3 emitted, glow;
+        int event = marchCompactObject(r, gravity, firstTMax, emitted, glow);
+        radiance += glow;
+        if (event == BH_EVENT_HORIZON) {
+            bounces = 0u;                        // black
+        } else if (event == BH_EVENT_DISK || event == BH_EVENT_SURFACE) {
+            radiance += emitted;
+            bounces = 0u;
+        }
     }
 
     for (uint bounce = 0u; bounce < bounces; bounce++) {
         Hit hit;
         if (!traceRay(r, bounce == 0u ? firstTMax : T_MAX, hit)) {
-            if (bounce == 0u && firstEvent == BH_EVENT_DISK) {
-                radiance += throughput * firstEmission;
-            } else if (!(bounce == 0u && firstEvent == BH_EVENT_HORIZON)) {
-                radiance += throughput * getSkyColor(r.dir);
-            }
+            radiance += throughput * getSkyColor(r.dir);
             break;
         }
         InstanceInfo material = instances[hit.instance];
@@ -532,6 +602,9 @@ void main() {
     // Guard against NaN/Inf and rare extreme samples (fireflies) before averaging.
     if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
     radiance = min(radiance, vec3(100.0));
+    if (splitView && frame.blackHole.w > 0.0 && abs(pixel.x - imageSize.x / 2) < 1) {
+        radiance = vec3(0.35); // divider: straight light on the left, bent light on the right
+    }
 
     // Running average over all samples since the last change.
     vec3 average = radiance;

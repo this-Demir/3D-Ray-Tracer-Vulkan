@@ -4,7 +4,7 @@ import dev.demir.vulkan.engine.EngineStats;
 import dev.demir.vulkan.engine.VulkanEngine;
 import dev.demir.vulkan.renderer.FrameData;
 import dev.demir.vulkan.scene.Animation;
-import dev.demir.vulkan.scene.BlackHole;
+import dev.demir.vulkan.scene.CompactObject;
 import dev.demir.vulkan.scene.Camera;
 import dev.demir.vulkan.scene.Geometry;
 import dev.demir.vulkan.scene.Material;
@@ -57,7 +57,7 @@ public class VulkanApp {
     private final Camera camera = new Camera(new Vec3(0, 10, 40), new Vec3(0, 0, 0), new Vec3(0, 1, 0), 40,
             (double) RENDER_WIDTH / RENDER_HEIGHT);
     private RenderSettings renderSettings = RenderSettings.DEFAULT;
-    private BlackHole currentBlackHole; // from the loaded preset, or null
+    private CompactObject currentCompactObject; // from the loaded preset, or null
 
     // --- UI ---
     private JFrame frame;
@@ -161,7 +161,7 @@ public class VulkanApp {
         camera.setOrigin(preset.cameraOrigin());
         camera.setLookAt(preset.cameraLookAt());
         camera.setVfov(preset.vfov());
-        currentBlackHole = preset.blackHole();
+        currentCompactObject = preset.compactObject();
         engine.submitCamera(camera.state());
         updateSettings(preset.settings());
         sceneSettingsPanel.show(preset.settings(), preset);
@@ -246,7 +246,7 @@ public class VulkanApp {
         sceneBuildInProgress = true;
         rebuildRequested = false;
 
-        BlackHole blackHole = currentBlackHole; // captured on the UI thread
+        CompactObject compactObject = currentCompactObject; // captured on the UI thread
         List<InstanceSpec> specs = new ArrayList<>();
         for (int i = 0; i < objects.size(); i++) {
             ModelInstance instance = objects.get(i);
@@ -255,7 +255,7 @@ public class VulkanApp {
         }
 
         CompletableFuture
-                .supplyAsync(() -> loadSceneDescription(specs, blackHole))
+                .supplyAsync(() -> loadSceneDescription(specs, compactObject))
                 .whenCompleteAsync((description, error) -> {
                     if (error != null) {
                         error.printStackTrace();
@@ -275,7 +275,7 @@ public class VulkanApp {
      * Runs on the rebuild thread: resolves geometry (loading new files), skips models that fail
      * to load, and turns orbit center names into instance indices.
      */
-    private SceneDescription loadSceneDescription(List<InstanceSpec> specs, BlackHole blackHole) {
+    private SceneDescription loadSceneDescription(List<InstanceSpec> specs, CompactObject compactObject) {
         List<InstanceSpec> loaded = new ArrayList<>();
         List<Geometry> geometries = new ArrayList<>();
         for (InstanceSpec spec : specs) {
@@ -312,7 +312,7 @@ public class VulkanApp {
             instances.add(new SceneDescription.Instance(geometries.get(i), spec.position(), spec.rotation(),
                     spec.scale(), spec.material(), parent, animation.orbitPeriod(), animation.spinPeriod()));
         }
-        return new SceneDescription(instances, blackHole);
+        return new SceneDescription(instances, compactObject);
     }
 
     // --- Display ---

@@ -15,6 +15,7 @@ The renderer was rebuilt around the GPU's ray tracing hardware (RT cores). In or
 7. **Editor and scenes:** new side panel (scene settings, object pool, object list, object settings), mouse orbit / zoom camera, and the presets Custom, Mirror Room, Eclipse and ShowRoom.
 8. **Animation:** objects can orbit other objects and spin; the TLAS is rebuilt on the GPU inside every frame.
 9. **Black hole:** camera rays follow exact Schwarzschild light paths (RK4 on dx/dλ = v, dv/dλ = -3Mh²x/r⁵), each step traced as a ray query; thin accretion disk from 6M with gravitational and Doppler shift. A CPU twin of the integrator is unit-tested against exact results, and the rendered shadow measures 171.0 px for a predicted 171.4 px. Details: [docs/black-hole.md](docs/black-hole.md).
+10. **Neutron star:** the black hole ray march generalized to compact objects with a surface (`CompactObject`). Light from a 1.4 solar-mass, 12 km star shows 75.5 % of its surface; the rendered size (234.8 px, theory 234.6 px; 194.9 px without gravity) and the visible region are verified. Diagnostic colouring, a split view (straight vs bent light) and pulsar beams. Details: [docs/neutron-star.md](docs/neutron-star.md).
 
 ### Next
 

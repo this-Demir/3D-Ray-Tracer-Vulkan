@@ -50,7 +50,7 @@ public class VulkanEngine implements Runnable {
     private static final int FRAMES_IN_FLIGHT = 2;
 
     /** Frame UBO (std140, must match FrameUBO in pathtrace.comp). */
-    private static final int FRAME_UBO_SIZE = 128;
+    private static final int FRAME_UBO_SIZE = 144;
 
     // SPIR-V compiled at build time from src/main/shaders by the Gradle task 'compileShaders'.
     private static final String SHADER_RESOURCE = "/shaders/pathtrace.comp.spv";
@@ -369,17 +369,23 @@ public class VulkanEngine implements Runnable {
         ubo.putInt(76, rtScene.lightCount());
         ubo.putFloat(80, settings.exposure());
         ubo.putFloat(84, (float) sceneTime);
-        // 96: black hole (position, mass; mass 0 = none)   112: disk inner, outer, brightness, gravity on
-        dev.demir.vulkan.scene.BlackHole hole = rtScene.blackHole();
-        if (hole != null) {
-            putVec4(ubo, 96, hole.position());
-            ubo.putFloat(108, (float) hole.mass());
-            ubo.putFloat(112, (float) hole.diskInner());
-            ubo.putFloat(116, (float) hole.diskOuter());
-            ubo.putFloat(120, (float) hole.diskBrightness());
+        // 96: compact object (position, mass; mass 0 = none)
+        // 112: disk inner, outer, brightness, gravity on
+        // 128: surface radius (0 = black hole), spin period, magnetic tilt (radians), display flags
+        dev.demir.vulkan.scene.CompactObject object = rtScene.compactObject();
+        if (object != null) {
+            putVec4(ubo, 96, object.position());
+            ubo.putFloat(108, (float) object.mass());
+            ubo.putFloat(112, (float) object.diskInner());
+            ubo.putFloat(116, (float) object.diskOuter());
+            ubo.putFloat(120, (float) object.diskBrightness());
             ubo.putFloat(124, settings.gravity() ? 1f : 0f);
+            ubo.putFloat(128, (float) object.surfaceRadius());
+            ubo.putFloat(132, (float) object.spinPeriod());
+            ubo.putFloat(136, (float) Math.toRadians(object.magneticTilt()));
+            ubo.putFloat(140, (settings.splitView() ? 1 : 0) + (settings.pulsarBeams() ? 2 : 0)); // flags
         } else {
-            for (int offset = 96; offset < 128; offset += 4) ubo.putFloat(offset, 0f);
+            for (int offset = 96; offset < FRAME_UBO_SIZE; offset += 4) ubo.putFloat(offset, 0f);
         }
     }
 

@@ -22,7 +22,25 @@ public final class ScenePresets {
     }
 
     public static List<ScenePreset> all() {
-        return List.of(custom(), mirrorRoom(), eclipse(), showRoom(), blackHole(), blackHoleShadow());
+        return List.of(custom(), mirrorRoom(), eclipse(), showRoom(), blackHole(), blackHoleShadow(), neutronStar());
+    }
+
+    /**
+     * A neutron star of 1.4 solar masses and 12 km radius (R = 5.8M), spinning, with hot spots at the
+     * poles of a magnetic axis tilted by 45°. Bent light shows 75.5% of its surface instead of half:
+     * the orange parts are those straight light could never show. Seen from 30M it looks 13.34° large
+     * instead of 11.15°. See docs/neutron-star.md.
+     */
+    public static ScenePreset neutronStar() {
+        double elevation = Math.toRadians(10);
+        CompactObject star = CompactObject.neutronStar(Vec3.ZERO, 1.0, 5.8, 6.0, 45.0);
+        return new ScenePreset("Neutron Star", () -> List.of(
+                new ModelInstance(SPHERE, "Moon").at(13, 0, 0).scaled(0.9)
+                        .with(Material.diffuse(0.75f, 0.72f, 0.68f)).orbiting(Animation.WORLD_ORIGIN, 9),
+                new ModelInstance(SPHERE, "Distant Star").at(-300, 150, 250).scaled(5)
+                        .with(Material.light(1f, 0.95f, 0.85f, 2000f))
+        ), new Vec3(0, 30 * Math.sin(elevation), 30 * Math.cos(elevation)), Vec3.ZERO, 40,
+                new RenderSettings(false, 0f, 6, 8192, true, true, false, true), star);
     }
 
     /**
@@ -33,7 +51,7 @@ public final class ScenePresets {
      */
     public static ScenePreset blackHole() {
         double elevation = Math.toRadians(5);
-        BlackHole hole = new BlackHole(Vec3.ZERO, 1.0, 6.0, 20.0, 1.0);
+        CompactObject hole = CompactObject.blackHole(Vec3.ZERO, 1.0, 6.0, 20.0, 1.0);
         return new ScenePreset("Black Hole", () -> List.of(
                 new ModelInstance(SPHERE, "Planet A").at(0, 0, -25).scaled(1.5)
                         .with(Material.diffuse(0.2f, 0.45f, 0.9f)),
@@ -44,7 +62,7 @@ public final class ScenePresets {
                 new ModelInstance(SPHERE, "Distant Star").at(300, 120, 200).scaled(5)
                         .with(Material.light(1f, 0.9f, 0.75f, 2000f))
         ), new Vec3(0, 40 * Math.sin(elevation), 40 * Math.cos(elevation)), Vec3.ZERO, 38,
-                new RenderSettings(false, 0f, 6, 8192, false, true), hole);
+                new RenderSettings(false, 0f, 6, 8192, false, true, false, false), hole);
     }
 
     /**
@@ -52,9 +70,9 @@ public final class ScenePresets {
      * shadow's angular radius is asin(3√3 M √(1 - 2M/r) / r) = 7.274°, i.e. 171.4 px at 30° vertical FOV.
      */
     public static ScenePreset blackHoleShadow() {
-        BlackHole hole = new BlackHole(Vec3.ZERO, 1.0, 6.0, 20.0, 0.0);
+        CompactObject hole = CompactObject.blackHole(Vec3.ZERO, 1.0, 6.0, 20.0, 0.0);
         return new ScenePreset("Black Hole: Shadow", List::of, new Vec3(0, 0, 40), Vec3.ZERO, 30,
-                new RenderSettings(true, 0f, 4, 4096, false, true), hole);
+                new RenderSettings(true, 0f, 4, 4096, false, true, false, false), hole);
     }
 
     /** The free editor: a ground plane and a figure under the sky. */
@@ -91,7 +109,7 @@ public final class ScenePresets {
             objects.add(new ModelInstance(SPHERE, "Gold Ball").at(-7, 2, 4).scaled(2)
                     .with(Material.metal(1f, 0.78f, 0.34f, 0.05f)));
             return objects;
-        }, new Vec3(-6, 13, 17), new Vec3(0, 7, -6), 65, new RenderSettings(false, 0.5f, 30, 8192, false, true), null);
+        }, new Vec3(-6, 13, 17), new Vec3(0, 7, -6), 65, new RenderSettings(false, 0.5f, 30, 8192, false, true, false, false), null);
     }
 
     /**
@@ -112,7 +130,7 @@ public final class ScenePresets {
                 new ModelInstance(MOON, "Asteroid").at(22, 6, 26).rotated(30, 40, 0).scaled(0.8)
                         .with(Material.diffuse(0.5f, 0.45f, 0.4f)).spinning(6)
         // Camera between the sun and Earth, looking at Earth's sunlit side where the moon's shadow falls.
-        ), new Vec3(26, 8, 22), new Vec3(45, 0.5, 0), 30, new RenderSettings(false, 0f, 6, 8192, true, true), null);
+        ), new Vec3(26, 8, 22), new Vec3(45, 0.5, 0), 30, new RenderSettings(false, 0f, 6, 8192, true, true, false, false), null);
     }
 
     /** A display floor with models, a mirror wall behind them and the sky as light. */
@@ -134,6 +152,6 @@ public final class ScenePresets {
                 new ModelInstance(CUBE, "Cube").at(10, 2, 13).rotated(0, 35, 0).scaled(4)
                         .with(Material.metal(0.3f, 0.6f, 0.9f, 0.3f)),
                 new ModelInstance(SPHERE, "Chrome Ball").at(0, 2.5, 14).scaled(2.5).with(Material.mirror())
-        ), new Vec3(0, 14, 48), new Vec3(0, 5, 0), 45, new RenderSettings(true, 0f, 10, 8192, false, true), null);
+        ), new Vec3(0, 14, 48), new Vec3(0, 5, 0), 45, new RenderSettings(true, 0f, 10, 8192, false, true, false, false), null);
     }
 }

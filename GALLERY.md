@@ -23,6 +23,10 @@ Rendered with the RT-core path tracer on an NVIDIA RTX 5060 Ti (the built-in sce
     <td align="center"><img src="render_images/rt/black-hole.jpg" width="400" /><br/><sub>Black Hole</sub></td>
     <td align="center"><img src="render_images/rt/black-hole-no-gravity.jpg" width="400" /><br/><sub>Black Hole without gravity</sub></td>
   </tr>
+  <tr>
+    <td align="center"><img src="render_images/rt/neutron-star.jpg" width="400" /><br/><sub>Neutron Star</sub></td>
+    <td align="center"><img src="render_images/rt/neutron-star-split.jpg" width="400" /><br/><sub>Neutron Star, split view (straight | bent light)</sub></td>
+  </tr>
 </table>
 
 ---
