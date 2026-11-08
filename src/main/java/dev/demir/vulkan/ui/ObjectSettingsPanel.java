@@ -1,5 +1,6 @@
 package dev.demir.vulkan.ui;
 
+import dev.demir.vulkan.scene.Animation;
 import dev.demir.vulkan.scene.Material;
 import dev.demir.vulkan.scene.ModelInstance;
 import dev.demir.vulkan.util.Vec3;
@@ -7,6 +8,8 @@ import dev.demir.vulkan.util.Vec3;
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
 import java.awt.*;
+import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * "Object settings" box: name, position, rotation, scale and material of the selected object.
@@ -30,14 +33,25 @@ public final class ObjectSettingsPanel extends JPanel {
     private final JSpinner roughness = Forms.decimalSpinner(0, 0, 1, 0.05);
     private final JSpinner emission = Forms.decimalSpinner(1, 0, 100000, 1);
     private final JSpinner ior = Forms.decimalSpinner(1.5, 1, 3, 0.05);
+    private final JComboBox<String> orbitCenterBox = new JComboBox<>();
+    private final JSpinner orbitPeriod = Forms.decimalSpinner(0, -100000, 100000, 1);
+    private final JSpinner spinPeriod = Forms.decimalSpinner(0, -100000, 100000, 1);
+
+    private static final String NO_ORBIT = "(none)";
 
     private final Runnable onChanged;
+    private final Supplier<List<String>> objectNames;
     private ModelInstance selected;
     private boolean updating;
 
-    public ObjectSettingsPanel(Runnable onChanged) {
+    /**
+     * @param onChanged   called after every edit of the selected object
+     * @param objectNames names of all objects, offered as orbit centers
+     */
+    public ObjectSettingsPanel(Runnable onChanged, Supplier<List<String>> objectNames) {
         super(new GridBagLayout());
         this.onChanged = onChanged;
+        this.objectNames = objectNames;
         setBorder(new TitledBorder("Object settings"));
 
         JPanel scaleRow = new JPanel(new BorderLayout(4, 0));
@@ -58,7 +72,13 @@ public final class ObjectSettingsPanel extends JPanel {
         Forms.row(this, row++, "Color:", colorButton);
         Forms.row(this, row++, "Roughness:", roughness);
         Forms.row(this, row++, "Emission:", emission);
-        Forms.row(this, row, "IOR:", ior);
+        Forms.row(this, row++, "IOR:", ior);
+        Forms.row(this, row++, "Orbit around:", orbitCenterBox);
+        Forms.row(this, row++, "Orbit period (s):", orbitPeriod);
+        Forms.row(this, row, "Spin period (s):", spinPeriod);
+        orbitCenterBox.setToolTipText("Circles around this object, keeping its current distance (needs Play animation)");
+        orbitPeriod.setToolTipText("Seconds per orbit; negative = other direction; 0 = no orbit");
+        spinPeriod.setToolTipText("Seconds per turn around its own vertical axis; 0 = no spin");
 
         nameField.addActionListener(e -> applyName());
         nameField.addFocusListener(new java.awt.event.FocusAdapter() {
@@ -67,7 +87,9 @@ public final class ObjectSettingsPanel extends JPanel {
                 applyName();
             }
         });
-        for (JSpinner spinner : new JSpinner[]{posX, posY, posZ, rotX, rotY, rotZ, roughness, emission, ior}) {
+        orbitCenterBox.addActionListener(e -> apply());
+        for (JSpinner spinner : new JSpinner[]{posX, posY, posZ, rotX, rotY, rotZ, roughness, emission, ior,
+                orbitPeriod, spinPeriod}) {
             spinner.addChangeListener(e -> apply());
         }
         for (JSpinner spinner : new JSpinner[]{scaleX, scaleY, scaleZ}) {
@@ -104,6 +126,17 @@ public final class ObjectSettingsPanel extends JPanel {
             ior.setValue((double) m.ior());
             colorButton.setBackground(toColor(m.albedo()));
             updateEnabledFields(m.type());
+
+            Animation animation = instance.getAnimation();
+            orbitCenterBox.removeAllItems();
+            orbitCenterBox.addItem(NO_ORBIT);
+            orbitCenterBox.addItem(Animation.WORLD_ORIGIN);
+            for (String name : objectNames.get()) {
+                if (!name.equals(instance.getDisplayName())) orbitCenterBox.addItem(name);
+            }
+            orbitCenterBox.setSelectedItem(animation.orbitCenter() != null ? animation.orbitCenter() : NO_ORBIT);
+            orbitPeriod.setValue(animation.orbitPeriod());
+            spinPeriod.setValue(animation.spinPeriod());
         } finally {
             updating = false;
         }
@@ -121,6 +154,10 @@ public final class ObjectSettingsPanel extends JPanel {
                 .withIor(((Number) ior.getValue()).floatValue());
         selected.setMaterial(m);
         updateEnabledFields(type);
+
+        String center = (String) orbitCenterBox.getSelectedItem();
+        selected.setAnimation(new Animation(NO_ORBIT.equals(center) ? null : center,
+                ((Number) orbitPeriod.getValue()).doubleValue(), ((Number) spinPeriod.getValue()).doubleValue()));
         onChanged.run();
     }
 

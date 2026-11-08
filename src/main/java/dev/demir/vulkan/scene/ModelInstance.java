@@ -16,6 +16,7 @@ public class ModelInstance {
     private Vec3 rotation = new Vec3(0, 0, 0); // Euler angles in degrees, applied X, then Y, then Z
     private Vec3 scale = new Vec3(1, 1, 1);
     private Material material = Material.diffuse(0.8f, 0.8f, 0.8f);
+    private Animation animation = Animation.NONE;
 
     /**
      * @param modelPath   .obj file path, or {@link SphereGeometry#KEY}
@@ -33,6 +34,7 @@ public class ModelInstance {
         copy.rotation = rotation;
         copy.scale = scale;
         copy.material = material;
+        copy.animation = animation;
         return copy;
     }
 
@@ -63,6 +65,18 @@ public class ModelInstance {
         return this;
     }
 
+    /** Orbits the named object (or {@link Animation#WORLD_ORIGIN}) once every 'periodSeconds'. */
+    public ModelInstance orbiting(String center, double periodSeconds) {
+        animation = new Animation(center, periodSeconds, animation.spinPeriod());
+        return this;
+    }
+
+    /** Turns around its own vertical axis once every 'periodSeconds'. */
+    public ModelInstance spinning(double periodSeconds) {
+        animation = new Animation(animation.orbitCenter(), animation.orbitPeriod(), periodSeconds);
+        return this;
+    }
+
     // --- Getters / setters ---
 
     public String getDisplayName() { return displayName; }
@@ -71,20 +85,14 @@ public class ModelInstance {
     public Vec3 getRotation() { return rotation; }
     public Vec3 getScale() { return scale; }
     public Material getMaterial() { return material; }
+    public Animation getAnimation() { return animation; }
+    public void setAnimation(Animation animation) { this.animation = animation; }
 
     public void setDisplayName(String displayName) { this.displayName = displayName; }
     public void setPosition(Vec3 position) { this.position = position; }
     public void setRotation(Vec3 rotation) { this.rotation = rotation; }
     public void setScale(Vec3 scale) { this.scale = scale; }
     public void setMaterial(Material material) { this.material = material; }
-
-    /**
-     * Object-to-world transform as a row-major 3x4 matrix (the layout Vulkan's
-     * VkTransformMatrixKHR expects): M = Translate * Rz * Ry * Rx * Scale.
-     */
-    public float[] toTransform3x4() {
-        return Transforms.compose(position, rotation, scale);
-    }
 
     /** Shown in the object list. */
     @Override

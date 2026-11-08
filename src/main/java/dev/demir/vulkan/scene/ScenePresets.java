@@ -59,7 +59,7 @@ public final class ScenePresets {
             objects.add(new ModelInstance(SPHERE, "Gold Ball").at(-7, 2, 4).scaled(2)
                     .with(Material.metal(1f, 0.78f, 0.34f, 0.05f)));
             return objects;
-        }, new Vec3(-6, 13, 17), new Vec3(0, 7, -6), 65, new RenderSettings(false, 0.5f, 30, 8192));
+        }, new Vec3(-6, 13, 17), new Vec3(0, 7, -6), 65, new RenderSettings(false, 0.5f, 30, 8192, false));
     }
 
     /**
@@ -71,13 +71,16 @@ public final class ScenePresets {
                 new ModelInstance(SPHERE, "Sun").scaled(10).with(Material.light(1f, 0.9f, 0.7f, 20f)),
                 new ModelInstance(SPHERE, "Earth").at(48, 0, 0).scaled(4).with(Material.diffuse(0.15f, 0.35f, 0.85f)),
                 // Umbra length = r_moon * d / (r_sun - r_moon) = 2 * 41 / 8 ~ 10 > 41 -> 44: it reaches Earth.
-                new ModelInstance(SPHERE, "Moon").at(41, 0.5, 0).scaled(2).with(Material.diffuse(0.7f, 0.7f, 0.68f)),
-                new ModelInstance(SPHERE, "Mars").at(-30, -2, 22).scaled(3).with(Material.diffuse(0.8f, 0.25f, 0.1f)),
-                new ModelInstance(SPHERE, "Venus").at(-20, 3, -26).scaled(2.4).with(Material.diffuse(0.85f, 0.75f, 0.45f)),
+                new ModelInstance(SPHERE, "Moon").at(41, 0.5, 0).scaled(2).with(Material.diffuse(0.7f, 0.7f, 0.68f))
+                        .orbiting("Earth", 10),
+                new ModelInstance(SPHERE, "Mars").at(-30, -2, 22).scaled(3).with(Material.diffuse(0.8f, 0.25f, 0.1f))
+                        .orbiting(Animation.WORLD_ORIGIN, 60),
+                new ModelInstance(SPHERE, "Venus").at(-20, 3, -26).scaled(2.4).with(Material.diffuse(0.85f, 0.75f, 0.45f))
+                        .orbiting(Animation.WORLD_ORIGIN, 35),
                 new ModelInstance(MOON, "Asteroid").at(22, 6, 26).rotated(30, 40, 0).scaled(0.8)
-                        .with(Material.diffuse(0.5f, 0.45f, 0.4f))
+                        .with(Material.diffuse(0.5f, 0.45f, 0.4f)).spinning(6)
         // Camera between the sun and Earth, looking at Earth's sunlit side where the moon's shadow falls.
-        ), new Vec3(26, 8, 22), new Vec3(45, 0.5, 0), 30, new RenderSettings(false, 0f, 6, 8192));
+        ), new Vec3(26, 8, 22), new Vec3(45, 0.5, 0), 30, new RenderSettings(false, 0f, 6, 8192, true));
     }
 
     /** A display floor with models, a mirror wall behind them and the sky as light. */
@@ -89,7 +92,7 @@ public final class ScenePresets {
                         .with(Material.mirror()),
                 // Model is Z-up: rotate it upright; its lowest point (z = 29) then sits on the platform.
                 new ModelInstance(AIRPLANE, "Airplane").at(0, -0.45, -3).rotated(-90, 0, 0).scaled(0.016)
-                        .with(Material.metal(0.85f, 0.15f, 0.1f, 0.15f)),
+                        .with(Material.metal(0.85f, 0.15f, 0.1f, 0.15f)).spinning(20),
                 new ModelInstance(HUMAN, "Gold Figure").at(-22, 0, 4).rotated(0, 30, 0).scaled(0.5)
                         .with(Material.metal(1f, 0.78f, 0.34f, 0.02f)),
                 new ModelInstance(HUMAN, "Glass Figure").at(22, 0, 4).rotated(0, -30, 0).scaled(0.5)
@@ -99,6 +102,6 @@ public final class ScenePresets {
                 new ModelInstance(CUBE, "Cube").at(10, 2, 13).rotated(0, 35, 0).scaled(4)
                         .with(Material.metal(0.3f, 0.6f, 0.9f, 0.3f)),
                 new ModelInstance(SPHERE, "Chrome Ball").at(0, 2.5, 14).scaled(2.5).with(Material.mirror())
-        ), new Vec3(0, 14, 48), new Vec3(0, 5, 0), 45, new RenderSettings(true, 0f, 10, 8192));
+        ), new Vec3(0, 14, 48), new Vec3(0, 5, 0), 45, new RenderSettings(true, 0f, 10, 8192, false));
     }
 }

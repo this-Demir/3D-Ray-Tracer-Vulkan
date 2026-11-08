@@ -136,6 +136,14 @@ public class VulkanEngine implements Runnable {
     // --- Current State (VRT only) ---
     private RayTracingScene rtScene;
     private boolean sceneLoaded = false;
+
+    // --- Animation (VRT only) ---
+    private static final double ANIMATION_STEP = 1.0 / 60.0;
+    private double animationClock = 0;   // seconds of animation played so far
+    private long lastClockNs = System.nanoTime();
+    private double sceneTime = 0;        // animation time the scene is shown at (multiple of ANIMATION_STEP)
+    private boolean tlasDirty = false;   // sceneTime changed: the next frame rebuilds the TLAS
+    private final double[] slotLightTime = new double[FRAMES_IN_FLIGHT]; // time each slot's lights were written for
     private CameraState camera;
     private RenderSettings settings = RenderSettings.DEFAULT;
     private long sampleIndex = 0; // samples accumulated since the last change
@@ -228,7 +236,7 @@ public class VulkanEngine implements Runnable {
         pickPhysicalDevice();
         createLogicalDevice();
         gpuMemory = new GpuMemory(device, computeQueue, computeQueueFamilyIndex);
-        rtScene = new RayTracingScene(device, gpuMemory);
+        rtScene = new RayTracingScene(device, gpuMemory, FRAMES_IN_FLIGHT);
 
         try (MemoryStack stack = stackPush()) {
             createCommandPool(stack);
@@ -262,7 +270,7 @@ public class VulkanEngine implements Runnable {
                 waitAndPublish(slot);
             }
 
-            if (applyPendingChanges()) {
+            if (applyPendingChanges() | advanceAnimation()) {
                 sampleIndex = 0;
             }
 
@@ -292,7 +300,9 @@ public class VulkanEngine implements Runnable {
         if (newScene != null) {
             drainFramesInFlight();
             vkDeviceWaitIdle(device); // resources of the previous scene may still be in use
-            rtScene.update(newScene);
+            rtScene.update(newScene, sceneTime);
+            java.util.Arrays.fill(slotLightTime, sceneTime); // every slot's lights were written for sceneTime
+            tlasDirty = false;
             try (MemoryStack stack = stackPush()) {
                 for (FrameSlot slot : slots) {
                     updateDescriptorSet(stack, slot);
@@ -312,6 +322,28 @@ public class VulkanEngine implements Runnable {
             changed = true;
         }
         return changed;
+    }
+
+    /**
+     * Advances the animation clock while playing. Time moves in steps of 1/60 s, so all frames
+     * rendered within one step accumulate (less noise per displayed frame). Returns true when
+     * the step changed, i.e. objects moved and accumulation must restart.
+     */
+    private boolean advanceAnimation() {
+        long now = System.nanoTime();
+        double elapsed = (now - lastClockNs) / 1e9;
+        lastClockNs = now;
+        if (!settings.animate() || !rtScene.isAnimated()) {
+            return false;
+        }
+        animationClock += Math.min(elapsed, 0.1); // don't jump after a stall
+        double stepped = Math.floor(animationClock / ANIMATION_STEP) * ANIMATION_STEP;
+        if (stepped != sceneTime) {
+            sceneTime = stepped;
+            tlasDirty = true;
+            return true;
+        }
+        return false;
     }
 
     /** Waits for every frame still on the GPU and publishes them, oldest first. */
@@ -336,7 +368,7 @@ public class VulkanEngine implements Runnable {
         ubo.putInt(72, settings.skyEnabled() ? 1 : 0);
         ubo.putInt(76, rtScene.lightCount());
         ubo.putFloat(80, settings.exposure());
-        ubo.putFloat(84, 0f); // time
+        ubo.putFloat(84, (float) sceneTime);
     }
 
     private static void putVec4(ByteBuffer buffer, int offset, Vec3 v) {
@@ -357,6 +389,16 @@ public class VulkanEngine implements Runnable {
             if (queryPool != VK_NULL_HANDLE) {
                 vkCmdResetQueryPool(cmd, queryPool, slot.index * 2, 2);
                 vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, slot.index * 2);
+            }
+
+            // Animation: objects moved, so rebuild the TLAS in this command buffer (before the rays).
+            if (tlasDirty) {
+                rtScene.recordAnimationUpdate(cmd, slot.index, sceneTime);
+                slotLightTime[slot.index] = sceneTime;
+                tlasDirty = false;
+            } else if (slotLightTime[slot.index] != sceneTime) {
+                rtScene.updateSlotLights(slot.index, sceneTime); // TLAS already current; lights of this slot are not
+                slotLightTime[slot.index] = sceneTime;
             }
 
             // The previous frame's copy (same queue) must finish reading before this frame writes.
@@ -923,7 +965,7 @@ public class VulkanEngine implements Runnable {
                 .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                 .imageView(accumImageView);
         VkDescriptorBufferInfo.Buffer lightInfo = VkDescriptorBufferInfo.calloc(1, stack)
-                .buffer(rtScene.lightBuffer().buffer()).offset(0).range(VK_WHOLE_SIZE);
+                .buffer(rtScene.lightBuffer(slot.index).buffer()).offset(0).range(VK_WHOLE_SIZE);
 
         VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(6, stack);
         writes.get(4).sType$Default().dstSet(slot.descriptorSet).dstBinding(BINDING_ACCUMULATION)

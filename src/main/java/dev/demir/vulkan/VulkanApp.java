@@ -3,6 +3,7 @@ package dev.demir.vulkan;
 import dev.demir.vulkan.engine.EngineStats;
 import dev.demir.vulkan.engine.VulkanEngine;
 import dev.demir.vulkan.renderer.FrameData;
+import dev.demir.vulkan.scene.Animation;
 import dev.demir.vulkan.scene.Camera;
 import dev.demir.vulkan.scene.Geometry;
 import dev.demir.vulkan.scene.Material;
@@ -26,7 +27,9 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -136,7 +139,7 @@ public class VulkanApp {
         ObjectPoolPanel poolPanel = new ObjectPoolPanel(camera::getLookAt, this::addObject);
         objectListPanel = new ObjectListPanel(objects,
                 selected -> objectSettingsPanel.show(selected), this::duplicateObject, this::removeObject);
-        objectSettingsPanel = new ObjectSettingsPanel(this::objectsChanged);
+        objectSettingsPanel = new ObjectSettingsPanel(this::objectsChanged, this::objectNames);
 
         SideColumn column = new SideColumn(sceneSettingsPanel, poolPanel, objectListPanel, objectSettingsPanel);
         JScrollPane scroll = new JScrollPane(column, ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
@@ -198,6 +201,14 @@ public class VulkanApp {
         return name;
     }
 
+    private List<String> objectNames() {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < objects.size(); i++) {
+            names.add(objects.get(i).getDisplayName());
+        }
+        return names;
+    }
+
     private boolean contains(String name) {
         for (int i = 0; i < objects.size(); i++) {
             if (objects.get(i).getDisplayName().equals(name)) return true;
@@ -214,7 +225,8 @@ public class VulkanApp {
     // --- Scene rebuild (UI thread -> rebuild thread -> render thread) ---
 
     /** Values captured on the UI thread, so the rebuild thread never reads objects being edited. */
-    private record InstanceSpec(String modelPath, String name, float[] transform, Material material) {
+    private record InstanceSpec(String modelPath, String name, Vec3 position, Vec3 rotation, Vec3 scale,
+                                Material material, Animation animation) {
     }
 
     /**
@@ -234,8 +246,8 @@ public class VulkanApp {
         List<InstanceSpec> specs = new ArrayList<>();
         for (int i = 0; i < objects.size(); i++) {
             ModelInstance instance = objects.get(i);
-            specs.add(new InstanceSpec(instance.getModelPath(), instance.getDisplayName(),
-                    instance.toTransform3x4(), instance.getMaterial()));
+            specs.add(new InstanceSpec(instance.getModelPath(), instance.getDisplayName(), instance.getPosition(),
+                    instance.getRotation(), instance.getScale(), instance.getMaterial(), instance.getAnimation()));
         }
 
         CompletableFuture
@@ -255,16 +267,46 @@ public class VulkanApp {
                 }, SwingUtilities::invokeLater);
     }
 
-    /** Runs on the rebuild thread: resolves geometry (loading new files) and skips models that fail to load. */
+    /**
+     * Runs on the rebuild thread: resolves geometry (loading new files), skips models that fail
+     * to load, and turns orbit center names into instance indices.
+     */
     private SceneDescription loadSceneDescription(List<InstanceSpec> specs) {
-        List<SceneDescription.Instance> instances = new ArrayList<>();
+        List<InstanceSpec> loaded = new ArrayList<>();
+        List<Geometry> geometries = new ArrayList<>();
         for (InstanceSpec spec : specs) {
             try {
-                Geometry geometry = meshLibrary.get(spec.modelPath());
-                instances.add(new SceneDescription.Instance(geometry, spec.transform(), spec.material()));
+                geometries.add(meshLibrary.get(spec.modelPath()));
+                loaded.add(spec);
             } catch (RuntimeException e) {
                 System.err.println("WARN (SRT): Skipping '" + spec.name() + "': " + e.getMessage());
             }
+        }
+        Map<String, Integer> indexByName = new HashMap<>();
+        for (int i = 0; i < loaded.size(); i++) {
+            indexByName.putIfAbsent(loaded.get(i).name(), i);
+        }
+
+        List<SceneDescription.Instance> instances = new ArrayList<>();
+        for (int i = 0; i < loaded.size(); i++) {
+            InstanceSpec spec = loaded.get(i);
+            Animation animation = spec.animation();
+            int parent = SceneDescription.NO_ORBIT;
+            if (animation.orbits()) {
+                if (Animation.WORLD_ORIGIN.equals(animation.orbitCenter())) {
+                    parent = SceneDescription.ORBIT_WORLD_ORIGIN;
+                } else {
+                    Integer index = indexByName.get(animation.orbitCenter());
+                    if (index == null || index == i) {
+                        System.err.println("WARN (SRT): '" + spec.name() + "' orbits unknown object '"
+                                + animation.orbitCenter() + "'; ignoring the orbit.");
+                    } else {
+                        parent = index;
+                    }
+                }
+            }
+            instances.add(new SceneDescription.Instance(geometries.get(i), spec.position(), spec.rotation(),
+                    spec.scale(), spec.material(), parent, animation.orbitPeriod(), animation.spinPeriod()));
         }
         return new SceneDescription(instances);
     }
