@@ -14,37 +14,29 @@ public class Triangle implements Hittable {
 
     public final Vec3 v0, v1, v2;
     private final AABB bbox;
-    public final int materialIndex;
-    public final int vertexIndex;
 
     public final float r, g, b;
     public final float materialType; // 0.0f = Lambertian
 
     /**
      * Creates a new Triangle object.
+     * Its position in the GPU vertex/material buffers is decided later by BVHFlattener.
      * @param v0 Vertex 0
      * @param v1 Vertex 1
      * @param v2 Vertex 2
-     * @param matIndex The index of this triangle's material.
-     * @param vertIndex The starting index (e.g., i * 3) of this triangle in the main vertex buffer.
      * @param r Red component
      * @param g Green component
      * @param b Blue component
      * @param matType Material type (0.0f for Lambertian)
      */
-    public Triangle(Vec3 v0, Vec3 v1, Vec3 v2, int matIndex, int vertIndex,
-                    float r, float g, float b, float matType) {
+    public Triangle(Vec3 v0, Vec3 v1, Vec3 v2, float r, float g, float b, float matType) {
         this.v0 = v0;
         this.v1 = v1;
         this.v2 = v2;
-        this.materialIndex = matIndex;
-        this.vertexIndex = vertIndex;
 
         this.r = r;
         this.g = g;
         this.b = b;
-
-
         this.materialType = matType;
 
         this.bbox = calculateBoundingBox();
@@ -68,13 +60,5 @@ public class Triangle implements Hittable {
         if (max.z - min.z < epsilon) max = max.add(new Vec3(0, 0, epsilon));
 
         return new AABB(min, max);
-    }
-
-    /**
-     * Calculates the center point of the triangle's bounding box.
-     * Used by the BVH builder for sorting.
-     */
-    public Vec3 getCenter() {
-        return bbox.min.add(bbox.max).div(2.0);
     }
 }

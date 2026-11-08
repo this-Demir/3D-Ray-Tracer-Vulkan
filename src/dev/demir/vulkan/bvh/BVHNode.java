@@ -1,8 +1,6 @@
 package dev.demir.vulkan.bvh;
 
 import dev.demir.vulkan.scene.Hittable;
-import dev.demir.vulkan.scene.Ray;
-import dev.demir.vulkan.scene.HitRecord;
 
 /**
  * Represents a simple data node in the BVH tree.
@@ -30,13 +28,5 @@ public class BVHNode implements Hittable {
     public AABB boundingBox() {
         return this.bbox;
     }
-
-
-    public HitRecord hit(Ray r, double tMin, double tMax) {
-        // This logic will only be implemented on the GPU.
-        throw new UnsupportedOperationException(
-                "BVHNode.hit() is not implemented on the CPU. " +
-                        "Traversal logic is handled by the GPU compute shader."
-        );
-    }
+    // (Ray traversal happens only on the GPU, in the compute shader.)
 }

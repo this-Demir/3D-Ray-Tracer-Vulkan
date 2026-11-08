@@ -9,7 +9,6 @@ import dev.demir.vulkan.scene.Scene;         // NEW IMPORT
 import dev.demir.vulkan.scene.Triangle;
 import dev.demir.vulkan.util.Vec3;
 import org.lwjgl.assimp.*;
-import org.lwjgl.system.MemoryStack;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
@@ -18,7 +17,6 @@ import java.util.List;
 
 import static org.lwjgl.assimp.Assimp.*;
 import static org.lwjgl.system.MemoryUtil.memAllocFloat;
-import static org.lwjgl.system.MemoryStack.stackPush;
 
 /**
  * Advanced Phase 1: Updated SceneBuilder.
@@ -138,9 +136,8 @@ public class SceneBuilder {
         float b = (float) color.z;
 
         List<Hittable> hittableTriangles = new ArrayList<>();
-        int triangleCount = 0;
 
-        try (MemoryStack stack = stackPush()) {
+        try {
             AIScene scene = aiImportFile(modelPath, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
             if (scene == null || (scene.mFlags() & AI_SCENE_FLAGS_INCOMPLETE) != 0 || scene.mRootNode() == null) {
                 throw new RuntimeException("Failed to load model: " + aiGetErrorString());
@@ -174,12 +171,8 @@ public class SceneBuilder {
                     v2 = v2.multiply(scale).add(position);
                     // -----------------------------
 
-                    int materialIndex = triangleCount; // Still relative to this model
-                    int vertexIndex = triangleCount * 3;
-
                     // Create triangle with TRANSFORMED vertices and INSTANCE materials
-                    hittableTriangles.add(new Triangle(v0, v1, v2, materialIndex, vertexIndex, r, g, b, matType));
-                    triangleCount++;
+                    hittableTriangles.add(new Triangle(v0, v1, v2, r, g, b, matType));
                 }
             }
             aiReleaseImport(scene);
