@@ -23,7 +23,7 @@ public final class Schwarzschild {
     }
 
     /** Outcome of tracing one ray. */
-    public enum Fate { CAPTURED, ESCAPED, MAX_STEPS }
+    public enum Fate { CAPTURED, ESCAPED, HIT_SURFACE, MAX_STEPS }
 
     /**
      * @param fate      what happened to the ray
@@ -93,6 +93,16 @@ public final class Schwarzschild {
      * outside 3M, so a step proportional to r stays well-behaved for every ray that matters.
      */
     public static Result trace(double[] x0, double[] n, double mass, double escapeRadius, int maxSteps) {
+        return trace(x0, n, mass, escapeRadius, maxSteps, 0.0);
+    }
+
+    /**
+     * Like {@link #trace(double[], double[], double, double, int)}, for a compact object with a
+     * surface of radius surfaceRadius ≥ 3M (a neutron star; 0 = black hole). Each step's straight
+     * chord is intersected exactly with the surface sphere, as the shader does.
+     */
+    public static Result trace(double[] x0, double[] n, double mass, double escapeRadius, int maxSteps,
+                               double surfaceRadius) {
         double[] v0 = initialVelocity(x0, n, mass);
         double[] state = {x0[0], x0[1], x0[2], v0[0], v0[1], v0[2]};
         double h2 = cross2(x0, v0);
@@ -101,15 +111,29 @@ public final class Schwarzschild {
             double r = Math.sqrt(state[0] * state[0] + state[1] * state[1] + state[2] * state[2]);
             minRadius = Math.min(minRadius, r);
             double outward = state[0] * state[3] + state[1] * state[4] + state[2] * state[5];
-            if (r < 3.0 * mass && outward < 0) {
+            if (surfaceRadius == 0 && r < 3.0 * mass && outward < 0) {
                 return new Result(Fate.CAPTURED, direction(state), minRadius, i);
             }
             if (r > escapeRadius && outward > 0) {
                 return new Result(Fate.ESCAPED, direction(state), minRadius, i);
             }
+            double[] before = {state[0], state[1], state[2]};
             step(state, stepSize(r), h2, mass);
+            if (surfaceRadius > 0 && chordHitsSphere(before, new double[]{state[0], state[1], state[2]}, surfaceRadius)) {
+                return new Result(Fate.HIT_SURFACE, direction(state), surfaceRadius, i + 1);
+            }
         }
         return new Result(Fate.MAX_STEPS, direction(state), minRadius, maxSteps);
+    }
+
+    /** True if the straight segment a -> b passes inside the sphere of the given radius around the origin. */
+    static boolean chordHitsSphere(double[] a, double[] b, double radius) {
+        double[] d = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        double dd = dot(d, d);
+        // closest point of the segment to the origin
+        double t = Math.max(0, Math.min(1, -dot(a, d) / dd));
+        double[] p = {a[0] + t * d[0], a[1] + t * d[1], a[2] + t * d[2]};
+        return dot(p, p) <= radius * radius;
     }
 
     // --- small vector helpers ---
