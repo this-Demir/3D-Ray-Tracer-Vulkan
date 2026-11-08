@@ -4,9 +4,6 @@ package dev.demir.vulkan.engine; // New package for the engine
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
-import static org.lwjgl.glfw.GLFW.glfwInit;
-import static org.lwjgl.glfw.GLFW.glfwTerminate;
-import static org.lwjgl.glfw.GLFWVulkan.glfwGetRequiredInstanceExtensions;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.*;
 import static org.lwjgl.vulkan.EXTDebugUtils.*;
@@ -30,6 +27,7 @@ import java.nio.LongBuffer;
 import java.nio.channels.FileChannel;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /**
  * Core Vulkan Engine.
@@ -48,12 +46,15 @@ public class VulkanEngine implements Runnable {
     // Use the shader name you defined
     private static final String SHADER_PATH = "shaders_spv/compute_with_dynamic_light_source.spv";
 
-
-    private static final boolean ENABLE_VALIDATION_LAYERS = true;
+    // Validation is opt-in: run with -Dvulkan.validation=true. The layer ships with the
+    // Vulkan SDK, not with GPU drivers, so if it is missing we warn and run without it.
+    private static final String VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
+    private boolean validationEnabled = false;
 
     // --- Threading & State ---
     private volatile boolean isRunning = true;
     private final Thread thread;
+    private final Consumer<Throwable> onFatalError; // Called on the VRT if it crashes
 
     // --- Thread-Safe Queues (UI -> VRT Commands) ---
     private final AtomicReference<FrameData> frameQueue; // VRT -> UI: Publishes the completed frame
@@ -102,23 +103,14 @@ public class VulkanEngine implements Runnable {
     private Camera currentCamera = null; // This is a *copy* of the state from the UI thread
     private int isSkyEnabled = 1; // 1 = true (default ON), 0 = false
 
-    // Static Validation Layer Setup
-    private static final PointerBuffer VALIDATION_LAYERS;
-    static {
-        if (ENABLE_VALIDATION_LAYERS) {
-            VALIDATION_LAYERS = memAllocPointer(1);
-            VALIDATION_LAYERS.put(0, memASCII("VK_LAYER_KHRONOS_validation"));
-        } else {
-            VALIDATION_LAYERS = null;
-        }
-    }
-
     /**
      * Constructor. Prepares the engine and its communication channels.
      * @param frameQueue Thread-safe reference used to publish completed frames to the UI thread.
+     * @param onFatalError Called on the VRT if initialization or rendering fails; the engine stops afterwards.
      */
-    public VulkanEngine(AtomicReference<FrameData> frameQueue) {
+    public VulkanEngine(AtomicReference<FrameData> frameQueue, Consumer<Throwable> onFatalError) {
         this.frameQueue = frameQueue;
+        this.onFatalError = onFatalError;
         this.sceneQueue = new ConcurrentLinkedQueue<>();
         this.cameraQueue = new ConcurrentLinkedQueue<>();
         this.skyToggleQueue = new ConcurrentLinkedQueue<>(); // <-- NEW
@@ -195,10 +187,11 @@ public class VulkanEngine implements Runnable {
         try {
             initVulkan();
             mainLoop();
-        } catch (Exception e) {
+        } catch (Throwable t) { // Throwable: LWJGL reports e.g. stack overflow as an Error
             System.err.println("FATAL (VRT): VulkanEngine thread crashed!");
-            e.printStackTrace();
+            t.printStackTrace();
             isRunning = false;
+            onFatalError.accept(t);
         } finally {
             cleanup();
             System.out.println("LOG (VRT-LIFECYCLE): VulkanEngine shut down.");
@@ -210,10 +203,6 @@ public class VulkanEngine implements Runnable {
      */
     private void initVulkan() {
         System.out.println("LOG (VRT-LIFECYCLE): Starting VulkanEngine initialization...");
-        if (!glfwInit()) {
-            throw new RuntimeException("GLFW could not be initialized!");
-        }
-
         createInstance();
         setupDebugMessenger();
         pickPhysicalDevice();
@@ -547,7 +536,6 @@ public class VulkanEngine implements Runnable {
         if (device != null) vkDestroyDevice(device, null);
         if (debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
         if (instance != null) vkDestroyInstance(instance, null);
-        glfwTerminate();
     }
 
     /**
@@ -563,45 +551,61 @@ public class VulkanEngine implements Runnable {
     }
 
     // --- VULKAN HELPERS ---
+    /**
+     * Creates the Vulkan instance. The renderer is compute-only and reads frames back to the CPU,
+     * so no window-system (surface) extensions are needed; only debug utils when validating.
+     */
     private void createInstance() {
+        validationEnabled = Boolean.getBoolean("vulkan.validation") && isValidationLayerAvailable();
+        System.out.println("LOG (VRT-LIFECYCLE): Validation layers " + (validationEnabled ? "ENABLED" : "disabled")
+                + " (enable with -Dvulkan.validation=true).");
+
         try (MemoryStack stack = stackPush()) {
             VkApplicationInfo appInfo = VkApplicationInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_APPLICATION_INFO)
-                    .pApplicationName(memASCII("Vulkan Ray Tracer"))
+                    .pApplicationName(stack.UTF8("Vulkan Ray Tracer"))
                     .apiVersion(VK_API_VERSION_1_0);
             VkInstanceCreateInfo createInfo = VkInstanceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
                     .pApplicationInfo(appInfo);
-            PointerBuffer glfwExtensions = glfwGetRequiredInstanceExtensions();
-            if (glfwExtensions == null) {
-                throw new RuntimeException("Required GLFW extensions not found!");
-            }
-            PointerBuffer requiredExtensions;
-            if (ENABLE_VALIDATION_LAYERS) {
-                requiredExtensions = stack.mallocPointer(glfwExtensions.capacity() + 1);
-                requiredExtensions.put(glfwExtensions);
-                requiredExtensions.put(memASCII(VK_EXT_DEBUG_UTILS_EXTENSION_NAME));
-            } else {
-                requiredExtensions = glfwExtensions;
-            }
-            requiredExtensions.flip();
-            createInfo.ppEnabledExtensionNames(requiredExtensions);
-            if (ENABLE_VALIDATION_LAYERS) {
-                createInfo.ppEnabledLayerNames(VALIDATION_LAYERS);
+            if (validationEnabled) {
+                createInfo.ppEnabledExtensionNames(stack.pointers(stack.UTF8(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)));
+                createInfo.ppEnabledLayerNames(stack.pointers(stack.UTF8(VALIDATION_LAYER_NAME)));
                 VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack);
                 populateDebugMessengerCreateInfo(debugCreateInfo);
                 createInfo.pNext(debugCreateInfo.address());
             }
             PointerBuffer pInstance = stack.mallocPointer(1);
-            if (vkCreateInstance(createInfo, null, pInstance) != VK_SUCCESS) {
-                throw new RuntimeException("Failed to create Vulkan Instance!");
+            int result = vkCreateInstance(createInfo, null, pInstance);
+            if (result != VK_SUCCESS) {
+                throw new RuntimeException("Failed to create Vulkan Instance! VkResult = " + result);
             }
             instance = new VkInstance(pInstance.get(0), createInfo);
         }
     }
 
+    /**
+     * Returns true if the Khronos validation layer is installed; logs a warning otherwise.
+     */
+    private static boolean isValidationLayerAvailable() {
+        try (MemoryStack stack = stackPush()) {
+            IntBuffer layerCount = stack.ints(0);
+            vkEnumerateInstanceLayerProperties(layerCount, null);
+            VkLayerProperties.Buffer layers = VkLayerProperties.malloc(layerCount.get(0), stack);
+            vkEnumerateInstanceLayerProperties(layerCount, layers);
+            for (VkLayerProperties layer : layers) {
+                if (VALIDATION_LAYER_NAME.equals(layer.layerNameString())) {
+                    return true;
+                }
+            }
+        }
+        System.err.println("WARN (VRT-LIFECYCLE): Validation requested, but " + VALIDATION_LAYER_NAME
+                + " is not installed (it comes with the Vulkan SDK). Continuing without validation.");
+        return false;
+    }
+
     private void setupDebugMessenger() {
-        if (!ENABLE_VALIDATION_LAYERS) return;
+        if (!validationEnabled) return;
         try (MemoryStack stack = stackPush()) {
             VkDebugUtilsMessengerCreateInfoEXT createInfo = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack);
             populateDebugMessengerCreateInfo(createInfo);
@@ -643,6 +647,9 @@ public class VulkanEngine implements Runnable {
             if (physicalDevice == null) {
                 throw new RuntimeException("No suitable GPU found!");
             }
+            VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
+            vkGetPhysicalDeviceProperties(physicalDevice, properties);
+            System.out.println("LOG (VRT-LIFECYCLE): Using GPU: " + properties.deviceNameString());
         }
     }
 
@@ -679,10 +686,7 @@ public class VulkanEngine implements Runnable {
                     .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
                     .pQueueCreateInfos(queueCreateInfo)
                     .pEnabledFeatures(deviceFeatures);
-
-            if (ENABLE_VALIDATION_LAYERS) {
-                createInfo.ppEnabledLayerNames(VALIDATION_LAYERS);
-            }
+            // (Device-level layers are deprecated in Vulkan; the instance layer covers the device.)
             PointerBuffer pDevice = stack.mallocPointer(1);
             if (vkCreateDevice(physicalDevice, createInfo, null, pDevice) != VK_SUCCESS) {
                 throw new RuntimeException("Failed to create logical device!");

@@ -7,6 +7,7 @@ import dev.demir.vulkan.scene.Camera;
 import dev.demir.vulkan.scene.ModelInstance;
 import dev.demir.vulkan.scene.Scene;
 import dev.demir.vulkan.util.Vec3;
+import org.lwjgl.system.Configuration;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -80,6 +81,9 @@ public class VulkanApp {
     // --- 3-THREAD-FIX: This flag pauses accumulation in updateUI() ---
     private volatile boolean sceneBuildInProgress = false;
 
+    // Set (on the UI thread) when the render thread has crashed; stops the FPS title updates.
+    private boolean renderEngineStopped = false;
+
     // --- Helper class for Color ComboBox ---
     private static class ColorPreset {
         private final String name;
@@ -104,6 +108,11 @@ public class VulkanApp {
 
 
     public static void main(String[] args) {
+        // LWJGL's per-thread MemoryStack defaults to 64 KB. Creating a VkInstance enumerates every
+        // device extension onto that stack, and modern drivers (e.g. NVIDIA, Vulkan 1.4) list
+        // enough of them to overflow it. Must be set before any LWJGL class uses the stack.
+        Configuration.STACK_SIZE.set(512); // in KB
+
         // Set Nimbus Look and Feel
         try {
             for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels()) {
@@ -128,7 +137,8 @@ public class VulkanApp {
     }
 
     public VulkanApp() {
-        this.vulkanEngine = new VulkanEngine(latestFrame);
+        this.vulkanEngine = new VulkanEngine(latestFrame,
+                error -> SwingUtilities.invokeLater(() -> showRenderEngineError(error)));
         this.camera = new Camera(
                 new Vec3(-25, 30, 140), // origin
                 new Vec3(0, 0, 0),  // lookAt
@@ -224,7 +234,7 @@ public class VulkanApp {
             frameCount++;
         }
         long now = System.nanoTime();
-        if (now - lastFrameTime >= 1_000_000_000) {
+        if (!renderEngineStopped && now - lastFrameTime >= 1_000_000_000) {
             // Update FPS counter and also show accumulated frames
             int accumulatedFrames = (camera != null) ? camera.getFrameCount() : 0;
             // System.out.println(logPrefix + "FPS Update. Samples: " + accumulatedFrames);
@@ -232,6 +242,20 @@ public class VulkanApp {
             frameCount = 20;
             lastFrameTime = now;
         }
+    }
+
+    /**
+     * Called on the UI thread when the Vulkan render thread has crashed.
+     * Without this the window would just stay black.
+     */
+    private void showRenderEngineError(Throwable error) {
+        renderEngineStopped = true;
+        if (frame != null) {
+            frame.setTitle("Vulkan Ray Tracer | Render engine stopped");
+        }
+        JOptionPane.showMessageDialog(frame,
+                "The Vulkan render engine stopped:\n" + error + "\n\nSee the console for the full stack trace.",
+                "Render Engine Error", JOptionPane.ERROR_MESSAGE);
     }
 
     /**
@@ -304,7 +328,9 @@ public class VulkanApp {
     }
 
     /**
-     * Loads the default scene ('ground_plane.obj', 'car.obj', 'sun.obj')
+     * Loads the default scene from models committed to the repo
+     * ('ground_plane.obj', 'FinalBaseMesh.obj'). 'car.obj' and 'sun.obj' are
+     * gitignored, so they can only be added with "Add Model" when present locally.
      */
     private void populateDefaultScene() {
         System.out.println("LOG (UI-POPULATE): Populating default scene...");
@@ -318,14 +344,14 @@ public class VulkanApp {
         scene.addInstance(plane);
         listModel.addElement(plane);
 
-        // --- CAR (Metal) ---
-        ModelInstance car = new ModelInstance("./objects/car.obj", "Car");
-        car.setPosition(new Vec3(0, -8, 0));
-        car.setScale(new Vec3(2, 2, 2));
-        car.setColor(new Vec3(0.6, 0.7, 0.1));
-        car.setMaterialType(1.0f); // 1.0f = Metal
-        scene.addInstance(car);
-        listModel.addElement(car);
+        // --- HUMAN (Metal) --- (mesh is ~20.7 units tall, feet at y = 0)
+        ModelInstance human = new ModelInstance("./objects/FinalBaseMesh.obj", "Human");
+        human.setPosition(new Vec3(0, -10, 0));
+        human.setScale(new Vec3(1.5, 1.5, 1.5));
+        human.setColor(new Vec3(0.6, 0.7, 0.1));
+        human.setMaterialType(1.0f); // 1.0f = Metal
+        scene.addInstance(human);
+        listModel.addElement(human);
 
         /*
         // --- LIGHT SOURCE (Emissive) ---
@@ -339,7 +365,7 @@ public class VulkanApp {
          */
 
 
-        sceneObjectList.setSelectedValue(car, true); // Select the car by default
+        sceneObjectList.setSelectedValue(human, true); // Select the human by default
     }
 
 
