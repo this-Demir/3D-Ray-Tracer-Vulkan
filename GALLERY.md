@@ -25,7 +25,7 @@ Rendered with the RT-core path tracer on an NVIDIA RTX 5060 Ti (the built-in sce
   </tr>
   <tr>
     <td align="center"><img src="render_images/rt/neutron-star.jpg" width="400" /><br/><sub>Neutron Star</sub></td>
-    <td align="center"><img src="render_images/rt/neutron-star-split.jpg" width="400" /><br/><sub>Neutron Star, split view (straight | bent light)</sub></td>
+    <td align="center"><img src="render_images/rt/neutron-star-split.jpg" width="400" /><br/><sub>Neutron Star, diagnostic split view (straight | bent light)</sub></td>
   </tr>
 </table>
 

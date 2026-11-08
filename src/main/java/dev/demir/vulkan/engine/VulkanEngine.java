@@ -383,7 +383,8 @@ public class VulkanEngine implements Runnable {
             ubo.putFloat(128, (float) object.surfaceRadius());
             ubo.putFloat(132, (float) object.spinPeriod());
             ubo.putFloat(136, (float) Math.toRadians(object.magneticTilt()));
-            ubo.putFloat(140, (settings.splitView() ? 1 : 0) + (settings.pulsarBeams() ? 2 : 0)); // flags
+            ubo.putFloat(140, (settings.splitView() ? 1 : 0) + (settings.pulsarBeams() ? 2 : 0)
+                    + (settings.diagnostic() ? 4 : 0)); // flags
         } else {
             for (int offset = 96; offset < FRAME_UBO_SIZE; offset += 4) ubo.putFloat(offset, 0f);
         }

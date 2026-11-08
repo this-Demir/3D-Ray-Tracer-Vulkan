@@ -10,11 +10,13 @@ package dev.demir.vulkan.scene;
  * @param animate     play the scene's animations (orbits, spins)
  * @param gravity     black hole / neutron star scenes: bend light rays (true) or trace straight lines (false)
  * @param splitView   black hole / neutron star scenes: left half of the image with straight light, right half bent
- * @param pulsarBeams neutron star scenes: show glowing radiation cones along the magnetic axis
+ * @param pulsarBeams neutron star scenes: show the magnetosphere (radiation cones and magnetic field lines)
+ * @param diagnostic  black hole / neutron star scenes: diagnostic surface (grid, regions only bent light shows) instead of the realistic look
  */
 public record RenderSettings(boolean skyEnabled, float exposure, int maxBounces, int maxSamples,
-                             boolean animate, boolean gravity, boolean splitView, boolean pulsarBeams) {
+                             boolean animate, boolean gravity, boolean splitView, boolean pulsarBeams,
+                             boolean diagnostic) {
 
     /** Stops after 8192 samples: the image has converged and the GPU can rest. */
-    public static final RenderSettings DEFAULT = new RenderSettings(true, 0f, 10, 8192, false, true, false, false);
+    public static final RenderSettings DEFAULT = new RenderSettings(true, 0f, 10, 8192, false, true, false, false, false);
 }

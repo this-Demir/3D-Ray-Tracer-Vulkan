@@ -350,57 +350,117 @@ bool segmentHitsGeometry(vec3 origin, vec3 dir, float len) {
 
 const int BH_EVENT_SURFACE = 3;      // the ray ends on the neutron star's surface; 'emitted' is its light
 
-const vec3 BEAM_COLOR = vec3(0.55, 0.75, 1.0);
-
 // Rotates v around +y by angle a.
 vec3 rotateY(vec3 v, float a) {
     float c = cos(a), s = sin(a);
     return vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
 }
 
-// Neutron star surface seen at point p (relative to the star). Physical: black-body hot spots at the
-// magnetic poles and the gravitational redshift g = √(1 - 2M/R) (temperature × g, brightness × g⁴).
-// Diagnostic: a latitude-longitude grid, and orange for every point that straight light from the camera
-// can never reach (dot(n, toCamera) < R / distance), blue for the rest.
-vec3 surfaceEmission(vec3 p, bool gravity) {
+// Smooth 3D value noise in [0, 1] (hash at lattice points, trilinear with smoothstep weights).
+float hash3(vec3 c) {
+    uvec3 q = uvec3(ivec3(c) + 4096);
+    return float(pcg(q.x * 73856093u ^ pcg(q.y * 19349663u ^ pcg(q.z * 83492791u)))) / 4294967296.0;
+}
+
+float valueNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 w = f * f * (3.0 - 2.0 * f);
+    float a = mix(mix(hash3(i), hash3(i + vec3(1, 0, 0)), w.x), mix(hash3(i + vec3(0, 1, 0)), hash3(i + vec3(1, 1, 0)), w.x), w.y);
+    float b = mix(mix(hash3(i + vec3(0, 0, 1)), hash3(i + vec3(1, 0, 1)), w.x), mix(hash3(i + vec3(0, 1, 1)), hash3(i + vec3(1, 1, 1)), w.x), w.y);
+    return mix(a, b, w.z);
+}
+
+float spinAngle() {
+    return frame.compactSurface.y != 0.0 ? 6.28318530718 * frame.time / frame.compactSurface.y : 0.0;
+}
+
+// Magnetic axis in world orientation (tilted from the spin axis, turning with the star).
+vec3 magneticAxis() {
+    float tilt = frame.compactSurface.z;
+    return rotateY(vec3(sin(tilt), cos(tilt), 0.0), spinAngle());
+}
+
+bool diagnosticView() {
+    return (int(frame.compactSurface.w) & 4) != 0;
+}
+
+// Light leaving the neutron star surface at point p (relative to the star) towards the camera; the
+// photon leaves along -rayDir. With gravity the light is redshifted by g = √(1 - 2M/R): temperature × g,
+// brightness × g⁴.
+//  - Realistic look: a hot (~10⁶ K, blue-white) surface with gentle mottling, limb darkening
+//    I ∝ 0.35 + 0.65 μ (μ = cosine of the emission angle, as for a hot atmosphere), brighter polar caps.
+//  - Diagnostic look: latitude-longitude grid; orange where straight light from the camera can never
+//    reach (n · toCamera < R / distance), blue elsewhere.
+vec3 surfaceEmission(vec3 p, vec3 rayDir, bool gravity) {
     float M = frame.blackHole.w;
     float R = frame.compactSurface.x;
     vec3 n = normalize(p);
-
-    float spin = frame.compactSurface.y != 0.0 ? 6.28318530718 * frame.time / frame.compactSurface.y : 0.0;
-    vec3 ns = rotateY(n, -spin);                                   // in the star's rotating frame
-    float tilt = frame.compactSurface.z;
-    vec3 magneticAxis = vec3(sin(tilt), cos(tilt), 0.0);
-
-    vec3 toCamera = frame.origin.xyz - frame.blackHole.xyz;
-    float cameraDistance = length(toCamera);
-    bool hiddenToStraightLight = dot(n, toCamera / cameraDistance) < R / cameraDistance;
-    vec3 base = hiddenToStraightLight ? vec3(1.0, 0.42, 0.1) : vec3(0.22, 0.45, 1.0);
-
-    float latitude = degrees(asin(clamp(ns.y, -1.0, 1.0)));
-    float longitude = degrees(atan(ns.z, ns.x));
-    float toLatLine = abs(fract(latitude / 15.0 + 0.5) - 0.5) * 15.0;
-    float toLonLine = abs(fract(longitude / 15.0 + 0.5) - 0.5) * 15.0 * cos(radians(latitude));
-    float line = 1.0 - smoothstep(0.5, 1.1, min(toLatLine, toLonLine));
-    vec3 radiance = base * (0.9 - 0.6 * line) * 0.6;
-
+    vec3 ns = rotateY(n, -spinAngle());                       // in the star's rotating frame
     float g = gravity ? sqrt(1.0 - 2.0 * M / R) : 1.0;
-    float spot = smoothstep(cos(radians(17.0)), cos(radians(11.0)), abs(dot(ns, magneticAxis)));
-    radiance += spot * blackbody(11000.0 * g) * 3.0;
+    float cap = smoothstep(cos(radians(17.0)), cos(radians(10.0)), abs(dot(n, magneticAxis())));
+
+    vec3 radiance;
+    if (diagnosticView()) {
+        vec3 toCamera = frame.origin.xyz - frame.blackHole.xyz;
+        float cameraDistance = length(toCamera);
+        bool hiddenToStraightLight = dot(n, toCamera / cameraDistance) < R / cameraDistance;
+        vec3 base = hiddenToStraightLight ? vec3(1.0, 0.42, 0.1) : vec3(0.22, 0.45, 1.0);
+        float latitude = degrees(asin(clamp(ns.y, -1.0, 1.0)));
+        float longitude = degrees(atan(ns.z, ns.x));
+        float toLatLine = abs(fract(latitude / 15.0 + 0.5) - 0.5) * 15.0;
+        float toLonLine = abs(fract(longitude / 15.0 + 0.5) - 0.5) * 15.0 * cos(radians(latitude));
+        float line = 1.0 - smoothstep(0.5, 1.1, min(toLatLine, toLonLine));
+        radiance = base * (0.9 - 0.6 * line) * 0.6 + cap * blackbody(11000.0 * g) * 3.0;
+    } else {
+        float mu = clamp(dot(n, -rayDir), 0.0, 1.0);
+        float limb = 0.35 + 0.65 * mu;
+        float mottle = 0.55 * valueNoise(ns * 7.0) + 0.3 * valueNoise(ns * 19.0) + 0.15 * valueNoise(ns * 47.0);
+        vec3 surface = blackbody(18000.0 * g) * (0.8 + 0.4 * mottle);
+        vec3 hotCap = blackbody(30000.0 * g) * 5.0;
+        radiance = mix(surface * 1.4, hotCap, cap) * limb;
+    }
     return radiance * pow(g, 4.0);
 }
 
-// Glow of the pulsar beams (artistic): cones of about 10° around the magnetic axis, fading with distance.
-vec3 beamGlow(vec3 q, float len) {
+// Glow collected along a ray segment near a neutron star (realistic look only):
+//  - corona: a thin hot layer whose density falls off as exp(-(r - R) / (0.12 R));
+//  - with the magnetosphere switched on: dipole magnetic field lines r = L sin²θ (θ measured from the
+//    magnetic axis) for three shells L and six azimuths, and radiation cones along the magnetic axis.
+// The glow is sampled along the (bent) ray, so it is lensed like everything else.
+vec3 magnetosphereGlow(vec3 start, vec3 dir, float len) {
     float R = frame.compactSurface.x;
-    float r = length(q);
-    if (r <= R) return vec3(0.0);
-    float spin = frame.compactSurface.y != 0.0 ? 6.28318530718 * frame.time / frame.compactSurface.y : 0.0;
-    float tilt = frame.compactSurface.z;
-    vec3 magneticAxis = rotateY(vec3(sin(tilt), cos(tilt), 0.0), spin);
-    float alignment = abs(dot(q / r, magneticAxis));
-    float cone = smoothstep(cos(radians(12.0)), cos(radians(4.0)), alignment);
-    return BEAM_COLOR * (0.04 * cone * len * exp(-(r - R) / (5.0 * R)));
+    if (R == 0.0 || diagnosticView()) return vec3(0.0);
+    bool magnetosphere = (int(frame.compactSurface.w) & 2) != 0;
+    vec3 axis = magneticAxis();
+    vec3 e1 = normalize(cross(axis, abs(axis.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+    vec3 e2 = cross(axis, e1);
+    vec3 glow = vec3(0.0);
+    for (int k = 0; k < 2; k++) {                              // two samples per segment
+        vec3 q = start + dir * (len * (0.25 + 0.5 * float(k)));
+        float r = length(q);
+        if (r <= R) continue;
+        float w = 0.5 * len;
+        if (r < 2.0 * R) glow += vec3(0.55, 0.7, 1.0) * (0.5 * exp(-(r - R) / (0.1 * R)) / R) * w;   // corona
+        if (!magnetosphere) continue;
+
+        float cosTheta = dot(q / r, axis);
+        float cone = smoothstep(cos(radians(13.0)), cos(radians(3.0)), abs(cosTheta));
+        glow += vec3(0.5, 0.7, 1.0) * (0.05 * cone * exp(-(r - R) / (6.0 * R))) * w;     // beams
+        if (r > 4.0 * R) continue;                                         // beyond the outermost field line
+
+        float sin2 = max(1.0 - cosTheta * cosTheta, 1e-4);
+        float phi = atan(dot(q, e2), dot(q, e1));
+        float nearestPhi = round(phi / 1.0471975512) * 1.0471975512;     // six field-line planes
+        float azimuthDistance = r * sqrt(sin2) * abs(phi - nearestPhi);
+        for (int s = 0; s < 3; s++) {
+            float L = R * (1.6 + 0.9 * float(s));
+            float radialDistance = abs(r - L * sin2);
+            float d2 = radialDistance * radialDistance + azimuthDistance * azimuthDistance;
+            glow += vec3(0.6, 0.55, 1.0) * (1.0 * exp(-d2 / (0.006 * R * R) - (r - R) / (2.5 * R)) / R) * w;    // field lines
+        }
+    }
+    return glow;
 }
 
 // Follows a camera ray past a compact object (black hole or neutron star). With gravity the ray is
@@ -421,7 +481,6 @@ int marchCompactObject(inout Ray r, bool gravity, out float tMax, out vec3 emitt
     bool blackHole = frame.compactSurface.x == 0.0;
     float surfaceRadius = blackHole ? (gravity ? 0.0 : 2.0 * M) : frame.compactSurface.x;
     bool disk = frame.blackHoleDisk.z > 0.0;
-    bool beams = !blackHole && (int(frame.compactSurface.w) & 2) != 0;
     emitted = vec3(0.0);
     glow = vec3(0.0);
     tMax = T_MAX;
@@ -489,7 +548,7 @@ int marchCompactObject(inout Ray r, bool gravity, out float tMax, out vec3 emitt
         if (surfaceT >= 0.0) segmentEnd = surfaceT;
         if (diskT >= 0.0 && diskT < segmentEnd) segmentEnd = diskT;
 
-        if (beams) glow += beamGlow(x0 + 0.5 * segmentEnd * chordDir, segmentEnd);
+        glow += magnetosphereGlow(x0, chordDir, segmentEnd);
 
         if (segmentHitsGeometry(x0 + center, chordDir, segmentEnd)) {
             r.origin = x0 + center;
@@ -502,7 +561,7 @@ int marchCompactObject(inout Ray r, bool gravity, out float tMax, out vec3 emitt
             r.dir = chordDir;
             tMax = max(surfaceT, T_MIN * 2.0);
             if (blackHole) return BH_EVENT_HORIZON;          // straight light into the horizon sphere
-            emitted = surfaceEmission(x0 + surfaceT * chordDir, gravity);
+            emitted = surfaceEmission(x0 + surfaceT * chordDir, chordDir, gravity);
             return BH_EVENT_SURFACE;
         }
         if (diskT >= 0.0) {

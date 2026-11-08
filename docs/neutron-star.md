@@ -5,7 +5,7 @@ by its gravity on the way to the camera. The **Neutron Star** scene uses the sam
 paths as the black hole (see [black-hole.md](black-hole.md)); the difference is that rays can end on a
 glowing surface. Units: G = c = 1, mass M.
 
-| Bent light, with pulsar beams | Split view: straight light (left) and bent light (right) |
+| Realistic look: bent light, corona, field lines and pulsar beams | Diagnostic split view: straight light (left) and bent light (right) |
 |---|---|
 | ![Neutron star](../render_images/rt/neutron-star.jpg) | ![Split view](../render_images/rt/neutron-star-split.jpg) |
 
@@ -61,19 +61,23 @@ Without bending the spot would vanish for about 40 % of each turn; with bending 
 
 ## 2. Visualization
 
-The scene has to make an invisible effect obvious, so some elements are physical and some are
-deliberately diagnostic:
+The scene has two looks. The default is a realistic picture of a pulsar; the *Diagnostic view* switch
+replaces it with a colouring that makes the invisible effect of bending obvious (and is what the
+measurements below use):
 
 | Element | Kind | Why |
 |---|---|---|
 | Light bending, apparent size, lensed star field | physical | exact ray marching |
 | Gravitational redshift of the surface (g⁴ brightness, g · temperature) | physical | uniform dimming / reddening |
-| Hot spots at the magnetic poles, black-body colour | physical model, simplified | the classic pulsar picture |
-| **Hidden-region colouring** of the surface: orange where straight light from the camera can never reach (n · toCamera < R / distance), blue elsewhere, with a latitude–longitude grid | diagnostic | every orange pixel is a part of the star that only bent light shows |
+| Hot surface: black-body colour, gentle mottling, limb darkening I ∝ 0.35 + 0.65 μ (μ = cosine of the emission angle) | physical model, simplified | a ~10⁶ K atmosphere is darker towards the limb; the true colour of such a hot surface is blue-white |
+| Hot polar caps at the magnetic poles | physical model, simplified | the classic pulsar picture; they spin into view and, thanks to bending, never fully disappear |
+| Corona: a thin glowing layer, density ∝ exp(-(r - R) / 0.1R) | artistic | gives the limb a halo; sampled along the bent ray |
+| Dipole magnetic field lines r = L sin²θ (θ from the magnetic axis), three shells L = 1.6R, 2.5R, 3.4R in six planes | physical shape, artistic glow | the field of a magnetized star; turns with the star; sampled along the bent ray, so it is lensed |
+| **Diagnostic view:** hidden-region colouring of the surface: orange where straight light from the camera can never reach (n · toCamera < R / distance), blue elsewhere, with a latitude–longitude grid | diagnostic | every orange pixel is a part of the star that only bent light shows |
 | **Split view**: left half straight light, right half bent light, same frame | diagnostic | direct comparison without toggling |
-| Pulsar beams: glowing cones along the magnetic axis | artistic | shows where the radiation goes; the glow is sampled along the bent ray, so the beams look bent near the star |
+| Pulsar beams: glowing cones along the magnetic axis (switch *Pulsar beams and field lines*) | artistic | shows where the radiation goes; the glow is sampled along the bent ray, so the beams look bent near the star |
 
-The star spins with *Play animation*, so the hot spots move to the far side and stay visible.
+The star spins with *Play animation*, so the hot caps, field lines and beams turn with it.
 
 ## 3. Implementation
 
@@ -84,7 +88,11 @@ The star spins with *Play animation*, so the hot spots move to the far side and 
   rule is only used for a black hole with gravity.
 - The scene data is a `CompactObject` (black hole: surface radius 0; neutron star: radius, spin period,
   magnetic tilt). The frame UBO carries it in three vec4s, plus the display flags.
-- *Split view* and *Pulsar beams* are switches in the Scene panel; the star spins with *Play animation*.
+- `surfaceEmission` gives the surface radiance (realistic or diagnostic, chosen by a flag bit), times g⁴ with gravity;
+  `magnetosphereGlow` adds the corona, field lines and beams for each chord of the ray (two samples per chord,
+  with early outs beyond the outermost field line), so the glow costs little: the scene still renders in ~15 ms.
+- *Split view*, *Pulsar beams and field lines* and *Diagnostic view* are switches in the Scene panel; the star
+  spins with *Play animation*.
 
 ## 4. Verification
 
@@ -98,14 +106,14 @@ The star spins with *Play animation*, so the hot spots move to the far side and 
 | Apparent angular radius from 30M | 13.34177° | 13.34141° (formula) |
 | Same without gravity | 11.14738° | asin(R/r) = 11.14738° |
 
-On the GPU (scene **Neutron Star**, animation and beams off, camera at 30M, 40° vertical field of view),
+On the GPU (scene **Neutron Star**, *Diagnostic view* on, animation and beams off, camera at 30M, 40° vertical field of view),
 radius measured from the image center in four directions with sub-pixel edge detection:
 
 | | Rendered | Theory |
 |---|---|---|
 | Radius with gravity | **234.8 px** (234.7 … 234.8) | 234.6 px |
 | Radius without gravity | **194.9 px** (194.9 … 195.0) | 194.9 px |
-| Pixels showing the hidden region (orange) | 16 001 with gravity, **0** without | 0 without gravity |
+| Pixels showing the hidden region (orange) | 16 014 with gravity, **0** without | 0 without gravity |
 
 Performance on an RTX 5060 Ti: about 15 ms GPU time per frame (~67 frames per second).
 

@@ -23,7 +23,7 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 * **Path Tracing:** Progressive accumulation (the image keeps refining until a sample limit), materials **Matte**, **Metal** (roughness 0 = mirror), **Glass** (refraction, Fresnel) and **Light** (emissive), direct light sampling with shadow rays towards spherical lights, Russian roulette, ACES tone mapping and exposure.
 * **Animation:** Objects can orbit other objects (or the origin) and spin; orbits nest (a moon around a planet around a sun). The TLAS is rebuilt on the GPU inside every frame.
 * **Black Hole:** Camera rays follow exact Schwarzschild light paths (RK4 integration, each step traced as a ray query), with a relativistic accretion disk (gravitational and Doppler shift, g⁴ beaming). Verified against known results: the rendered shadow is 171.0 px for a predicted 171.4 px.
-* **Neutron Star:** The same light paths ending on a glowing, spinning surface with gravitational redshift; diagnostic colouring of the regions only bent light can show, a split view (straight vs bent) and pulsar beams. The rendered star measures 234.8 px for a predicted 234.6 px (194.9 px without gravity).
+* **Neutron Star:** The same light paths ending on a hot, spinning surface (black-body colour, limb darkening, gravitational redshift) inside a thin corona, with dipole magnetic field lines and pulsar beams. A diagnostic view colours the regions only bent light can show, and a split view puts straight and bent light side by side. The rendered star measures 234.8 px for a predicted 234.6 px (194.9 px without gravity).
 * **Multi-Threaded Architecture:**
     * **UI Thread:** Responsive Swing Interface (never freezes).
     * **Vulkan Render Thread (VRT):** Dedicated rendering loop with two frames in flight; the only thread that makes Vulkan calls.
@@ -42,9 +42,9 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 | **Black Hole** | **Black Hole without gravity** |
 | ![Black Hole](render_images/rt/black-hole.jpg) | ![No gravity](render_images/rt/black-hole-no-gravity.jpg) |
 | Light bent around a Schwarzschild black hole: the far side of the accretion disk shows above and below the shadow, a planet hidden behind the hole appears as Einstein arcs, the approaching side of the disk is brighter (Doppler beaming). See [docs/black-hole.md](docs/black-hole.md) for the physics and its verification. | The same scene with straight light rays, for comparison: the horizon is a black sphere and the planet behind it is hidden. |
-| **Neutron Star** | **Neutron Star, split view** |
+| **Neutron Star** | **Neutron Star, diagnostic split view** |
 | ![Neutron Star](render_images/rt/neutron-star.jpg) | ![Split view](render_images/rt/neutron-star-split.jpg) |
-| A spinning neutron star (1.4 solar masses, 12 km) with hot spots and pulsar beams. Bent light shows 75.5 % of its surface instead of half; the orange parts are those straight light could never show. See [docs/neutron-star.md](docs/neutron-star.md). | Left half straight light, right half bent light: the star looks 20 % larger, redshifted, and shows its far side. |
+| A spinning neutron star (1.4 solar masses, 12 km): hot surface and polar caps, corona, magnetic field lines and pulsar beams, all seen through bent light. See [docs/neutron-star.md](docs/neutron-star.md). | Diagnostic view, left half straight light, right half bent light: the star looks 20 % larger, redshifted, and shows its far side (orange: 75.5 % of the surface is visible instead of half). |
 
 ##  System & Performance
 
@@ -103,7 +103,7 @@ graph TD
 * **W / S, A / D, Q / E:** Move forward / back, left / right, up / down (camera and target together)
 
 ### Side Panel
-* **Scene:** Load a preset (Custom, Mirror Room, Eclipse, ShowRoom, Black Hole, Black Hole: Shadow, Neutron Star); sky light, maximum bounces, exposure, sample limit (rendering stops when reached, 0 = never), *Play animation*, and for black hole and neutron star scenes *Gravity bends light*, *Split view* (left half straight light) and *Pulsar beams*.
+* **Scene:** Load a preset (Custom, Mirror Room, Eclipse, ShowRoom, Black Hole, Black Hole: Shadow, Neutron Star); sky light, maximum bounces, exposure, sample limit (rendering stops when reached, 0 = never), *Play animation*, and for black hole and neutron star scenes *Gravity bends light*, *Split view* (left half straight light), *Pulsar beams and field lines* and *Diagnostic view* (grid, hidden regions in orange).
 * **Object pool:** The sphere primitive and the models in `objects/`. *Add* (or double-click) places one where the camera looks; *Browse...* adds any `.obj` file.
 * **Objects:** The objects in the scene, with *Duplicate* and *Remove*.
 * **Object settings:** Name, position, rotation, scale, material (color, roughness, light brightness, index of refraction) and animation (orbit center, orbit period, spin period) of the selected object.
