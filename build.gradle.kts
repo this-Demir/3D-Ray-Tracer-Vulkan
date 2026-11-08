@@ -23,6 +23,34 @@ repositories {
     mavenCentral()
 }
 
+// Build-time tool that compiles GLSL shaders to SPIR-V with shaderc (no Vulkan SDK needed).
+val shaderTools: SourceSet = sourceSets.create("shaderTools")
+
+dependencies {
+    "shaderToolsImplementation"(platform("org.lwjgl:lwjgl-bom:$lwjglVersion"))
+    "shaderToolsImplementation"("org.lwjgl:lwjgl")
+    "shaderToolsImplementation"("org.lwjgl:lwjgl-shaderc")
+    "shaderToolsRuntimeOnly"("org.lwjgl:lwjgl::$lwjglNatives")
+    "shaderToolsRuntimeOnly"("org.lwjgl:lwjgl-shaderc::$lwjglNatives")
+}
+
+val compileShaders = tasks.register<JavaExec>("compileShaders") {
+    description = "Compiles src/main/shaders/*.comp to SPIR-V (classpath resources under /shaders)."
+    val sourceDir = layout.projectDirectory.dir("src/main/shaders")
+    val outputDir = layout.buildDirectory.dir("generated/shaders")
+    inputs.dir(sourceDir)
+    outputs.dir(outputDir)
+    classpath = shaderTools.runtimeClasspath
+    mainClass = "dev.demir.vulkan.tools.ShaderCompiler"
+    argumentProviders.add(CommandLineArgumentProvider {
+        listOf(sourceDir.asFile.absolutePath, outputDir.get().dir("shaders").asFile.absolutePath)
+    })
+}
+
+sourceSets.main {
+    resources.srcDir(compileShaders)
+}
+
 dependencies {
     implementation(platform("org.lwjgl:lwjgl-bom:$lwjglVersion"))
 

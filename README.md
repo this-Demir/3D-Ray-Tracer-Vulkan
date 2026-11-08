@@ -87,7 +87,7 @@ graph TD
 
 ### Prerequisites
 * **Java:** JDK 21.
-* **Vulkan:** A Vulkan-capable GPU. The Vulkan runtime comes with the GPU driver; the Vulkan SDK is only needed for validation layers.
+* **GPU:** Hardware ray tracing through Vulkan 1.2 (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query`), e.g. NVIDIA RTX 20 series or newer, AMD RX 6000 / RDNA2 or newer, Intel Arc. The Vulkan runtime comes with the GPU driver; the Vulkan SDK is only needed for validation layers.
 * **Build Tool:** None to install. The project uses the Gradle wrapper, which downloads Gradle and LWJGL on the first build.
 
 ### Running
@@ -95,7 +95,7 @@ graph TD
 ./gradlew run          # Windows (cmd/PowerShell): gradlew run
 ```
 
-Compiled shaders are committed in `shaders_spv/`, and the default scene uses models from `objects/`.
+Shaders live in `src/main/shaders/` and are compiled to SPIR-V during the build (Gradle task `compileShaders`, using shaderc through LWJGL), so no Vulkan SDK or `glslc` is needed. The default scene uses models from `objects/`.
 To turn on Vulkan validation (requires the Vulkan SDK), run `./gradlew run -Dvulkan.validation=true`.
 
 To get a standalone build: `./gradlew installDist`, then start `build/install/ray-tracer-vulkan/bin/ray-tracer-vulkan` from the repository root (shaders and models are loaded relative to the working directory).

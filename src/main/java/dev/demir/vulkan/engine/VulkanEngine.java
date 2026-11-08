@@ -18,13 +18,16 @@ import dev.demir.vulkan.renderer.GpuSceneData;
 import dev.demir.vulkan.scene.Camera;
 
 // Java utilities
-import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
-import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -43,13 +46,20 @@ public class VulkanEngine implements Runnable {
     private static final int WIDTH = 1280;
     private static final int HEIGHT = 720;
 
-    // Use the shader name you defined
-    private static final String SHADER_PATH = "shaders_spv/compute_with_dynamic_light_source.spv";
+    // SPIR-V compiled at build time from src/main/shaders by the Gradle task 'compileShaders'.
+    private static final String SHADER_RESOURCE = "/shaders/pathtrace.comp.spv";
 
     // Validation is opt-in: run with -Dvulkan.validation=true. The layer ships with the
     // Vulkan SDK, not with GPU drivers, so if it is missing we warn and run without it.
     private static final String VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
     private boolean validationEnabled = false;
+
+    // Hardware ray tracing (RT cores): acceleration structures + ray queries from the compute shader.
+    private static final String[] REQUIRED_DEVICE_EXTENSIONS = {
+            KHRAccelerationStructure.VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+            KHRRayQuery.VK_KHR_RAY_QUERY_EXTENSION_NAME,
+            KHRDeferredHostOperations.VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, // required by acceleration_structure
+    };
 
     // --- Threading & State ---
     private volatile boolean isRunning = true;
@@ -564,7 +574,7 @@ public class VulkanEngine implements Runnable {
             VkApplicationInfo appInfo = VkApplicationInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_APPLICATION_INFO)
                     .pApplicationName(stack.UTF8("Vulkan Ray Tracer"))
-                    .apiVersion(VK_API_VERSION_1_0);
+                    .apiVersion(VK12.VK_API_VERSION_1_2); // 1.2: buffer device address, needed for ray tracing
             VkInstanceCreateInfo createInfo = VkInstanceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
                     .pApplicationInfo(appInfo);
@@ -628,6 +638,10 @@ public class VulkanEngine implements Runnable {
         });
     }
 
+    /**
+     * Picks the GPU: it must support hardware ray tracing (see {@link #REQUIRED_DEVICE_EXTENSIONS}
+     * and {@link #findMissingRequirement}); among those, a discrete GPU wins over an integrated one.
+     */
     private void pickPhysicalDevice() {
         try (MemoryStack stack = stackPush()) {
             IntBuffer deviceCount = stack.ints(0);
@@ -637,25 +651,82 @@ public class VulkanEngine implements Runnable {
             }
             PointerBuffer pPhysicalDevices = stack.mallocPointer(deviceCount.get(0));
             vkEnumeratePhysicalDevices(instance, deviceCount, pPhysicalDevices);
+
+            List<String> rejected = new ArrayList<>();
+            int bestScore = -1;
+            String bestName = null;
             for (int i = 0; i < pPhysicalDevices.capacity(); i++) {
-                VkPhysicalDevice device = new VkPhysicalDevice(pPhysicalDevices.get(i), instance);
-                if (isDeviceSuitable(device)) {
-                    physicalDevice = device;
-                    break;
+                VkPhysicalDevice candidate = new VkPhysicalDevice(pPhysicalDevices.get(i), instance);
+                VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
+                vkGetPhysicalDeviceProperties(candidate, properties);
+                String name = properties.deviceNameString();
+
+                String missing = findMissingRequirement(candidate, properties);
+                if (missing != null) {
+                    rejected.add(name + " (" + missing + ")");
+                    System.out.println("LOG (VRT-LIFECYCLE): Skipping GPU " + name + ": " + missing);
+                    continue;
+                }
+                int score = switch (properties.deviceType()) {
+                    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU -> 2;
+                    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU -> 1;
+                    default -> 0;
+                };
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestName = name;
+                    physicalDevice = candidate;
                 }
             }
             if (physicalDevice == null) {
-                throw new RuntimeException("No suitable GPU found!");
+                throw new RuntimeException("No GPU with hardware ray tracing support found. This renderer needs "
+                        + "Vulkan 1.2 with VK_KHR_acceleration_structure and VK_KHR_ray_query "
+                        + "(e.g. NVIDIA RTX 20+, AMD RX 6000+, Intel Arc). Checked: " + rejected);
             }
-            VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
-            vkGetPhysicalDeviceProperties(physicalDevice, properties);
-            System.out.println("LOG (VRT-LIFECYCLE): Using GPU: " + properties.deviceNameString());
+            computeQueueFamilyIndex = findComputeQueueFamily(physicalDevice);
+            System.out.println("LOG (VRT-LIFECYCLE): Using GPU: " + bestName);
         }
     }
 
-    private boolean isDeviceSuitable(VkPhysicalDevice device) {
-        computeQueueFamilyIndex = findComputeQueueFamily(device);
-        return computeQueueFamilyIndex != -1;
+    /**
+     * Returns why the device cannot run the renderer, or null if it can.
+     */
+    private String findMissingRequirement(VkPhysicalDevice device, VkPhysicalDeviceProperties properties) {
+        if (VK_API_VERSION_MAJOR(properties.apiVersion()) == 1 && VK_API_VERSION_MINOR(properties.apiVersion()) < 2) {
+            return "Vulkan 1.2 not supported";
+        }
+        if (findComputeQueueFamily(device) == -1) {
+            return "no compute queue";
+        }
+        try (MemoryStack stack = stackPush()) {
+            IntBuffer extensionCount = stack.ints(0);
+            vkEnumerateDeviceExtensionProperties(device, (String) null, extensionCount, null);
+            VkExtensionProperties.Buffer extensions = VkExtensionProperties.malloc(extensionCount.get(0), stack);
+            vkEnumerateDeviceExtensionProperties(device, (String) null, extensionCount, extensions);
+            Set<String> available = new HashSet<>();
+            for (VkExtensionProperties extension : extensions) {
+                available.add(extension.extensionNameString());
+            }
+            for (String required : REQUIRED_DEVICE_EXTENSIONS) {
+                if (!available.contains(required)) {
+                    return "missing " + required;
+                }
+            }
+
+            VkPhysicalDeviceRayQueryFeaturesKHR rayQuery = VkPhysicalDeviceRayQueryFeaturesKHR.calloc(stack).sType$Default();
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructure =
+                    VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack).sType$Default().pNext(rayQuery.address());
+            VkPhysicalDeviceVulkan12Features vulkan12 =
+                    VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(accelerationStructure.address());
+            VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(vulkan12.address());
+            VK11.vkGetPhysicalDeviceFeatures2(device, features2);
+
+            if (!rayQuery.rayQuery()) return "rayQuery feature not supported";
+            if (!accelerationStructure.accelerationStructure()) return "accelerationStructure feature not supported";
+            if (!vulkan12.bufferDeviceAddress()) return "bufferDeviceAddress feature not supported";
+            if (!features2.features().shaderInt64()) return "shaderInt64 feature not supported";
+        }
+        return null;
     }
 
     private int findComputeQueueFamily(VkPhysicalDevice device) {
@@ -680,18 +751,42 @@ public class VulkanEngine implements Runnable {
                     .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
                     .queueFamilyIndex(computeQueueFamilyIndex)
                     .pQueuePriorities(pQueuePriorities);
-            VkPhysicalDeviceFeatures deviceFeatures = VkPhysicalDeviceFeatures.calloc(stack);
+            // Feature chain for hardware ray tracing (all checked in findMissingRequirement).
+            VkPhysicalDeviceRayQueryFeaturesKHR rayQuery = VkPhysicalDeviceRayQueryFeaturesKHR.calloc(stack)
+                    .sType$Default()
+                    .rayQuery(true);
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructure =
+                    VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack)
+                            .sType$Default()
+                            .pNext(rayQuery.address())
+                            .accelerationStructure(true);
+            VkPhysicalDeviceVulkan12Features vulkan12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
+                    .sType$Default()
+                    .pNext(accelerationStructure.address())
+                    .bufferDeviceAddress(true);
+            VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
+                    .sType$Default()
+                    .pNext(vulkan12.address());
+            features2.features().shaderInt64(true);
+
+            PointerBuffer extensionNames = stack.mallocPointer(REQUIRED_DEVICE_EXTENSIONS.length);
+            for (String extension : REQUIRED_DEVICE_EXTENSIONS) {
+                extensionNames.put(stack.UTF8(extension));
+            }
+            extensionNames.flip();
 
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+                    .pNext(features2.address()) // features go through pNext, so pEnabledFeatures stays null
                     .pQueueCreateInfos(queueCreateInfo)
-                    .pEnabledFeatures(deviceFeatures);
+                    .ppEnabledExtensionNames(extensionNames);
             // (Device-level layers are deprecated in Vulkan; the instance layer covers the device.)
             PointerBuffer pDevice = stack.mallocPointer(1);
-            if (vkCreateDevice(physicalDevice, createInfo, null, pDevice) != VK_SUCCESS) {
-                throw new RuntimeException("Failed to create logical device!");
+            int result = vkCreateDevice(physicalDevice, createInfo, null, pDevice);
+            if (result != VK_SUCCESS) {
+                throw new RuntimeException("Failed to create logical device! VkResult = " + result);
             }
-            device = new VkDevice(pDevice.get(0), physicalDevice, createInfo);
+            device = new VkDevice(pDevice.get(0), physicalDevice, createInfo, VK12.VK_API_VERSION_1_2);
             PointerBuffer pQueue = stack.mallocPointer(1);
             vkGetDeviceQueue(device, computeQueueFamilyIndex, 0, pQueue);
             computeQueue = new VkQueue(pQueue.get(0), device);
@@ -898,9 +993,9 @@ public class VulkanEngine implements Runnable {
      */
     private void createComputePipeline(MemoryStack stack) {
         try {
-            computeShaderModule = createShaderModule(loadShaderFromFile(SHADER_PATH));
+            computeShaderModule = createShaderModule(loadShaderResource(SHADER_RESOURCE));
         } catch (IOException e) {
-            throw new RuntimeException("Failed to load shader: " + e.getMessage());
+            throw new RuntimeException("Failed to load shader " + SHADER_RESOURCE + ": " + e.getMessage(), e);
         }
         VkPipelineShaderStageCreateInfo shaderStageInfo = VkPipelineShaderStageCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
@@ -1107,12 +1202,16 @@ public class VulkanEngine implements Runnable {
         throw new RuntimeException("Failed to find suitable memory type!");
     }
 
-    private ByteBuffer loadShaderFromFile(String filepath) throws IOException {
-        try (FileInputStream fis = new FileInputStream(filepath);
-             FileChannel fc = fis.getChannel()) {
-            ByteBuffer buffer = ByteBuffer.allocateDirect((int) fc.size());
-            while (fc.read(buffer) > 0) ;
-            return buffer.flip();
+    /**
+     * Reads a SPIR-V binary from the classpath into a direct buffer (Vulkan needs off-heap memory).
+     */
+    private ByteBuffer loadShaderResource(String resource) throws IOException {
+        try (InputStream in = VulkanEngine.class.getResourceAsStream(resource)) {
+            if (in == null) {
+                throw new IOException("not found on the classpath (run the Gradle build to compile shaders)");
+            }
+            byte[] bytes = in.readAllBytes();
+            return ByteBuffer.allocateDirect(bytes.length).put(bytes).flip();
         }
     }
 
