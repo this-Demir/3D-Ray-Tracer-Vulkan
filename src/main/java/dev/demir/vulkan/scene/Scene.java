@@ -45,26 +45,10 @@ public class Scene {
 
     /**
      * Returns an unmodifiable view of the model instances.
-     * The SceneBuilder will use this to build the scene.
+     * The UI thread turns these into an immutable SceneDescription for rendering.
      * @return A list of ModelInstances.
      */
     public List<ModelInstance> getInstances() {
         return Collections.unmodifiableList(instances);
-    }
-
-    /**
-     * Creates and returns a thread-safe snapshot of the scene.
-     * The SceneBuilder thread (SRT) should call this to get a stable
-     * list that won't change during the build process.
-     * @return A new Scene object containing a snapshot of the instances.
-     */
-    public Scene createSnapshot() {
-        Scene snapshot = new Scene();
-        // Because 'instances' is a CopyOnWriteArrayList, iterating
-        // it provides a stable snapshot at this moment in time.
-        for (ModelInstance inst : this.instances) {
-            snapshot.addInstance(inst);
-        }
-        return snapshot;
     }
 }

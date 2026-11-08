@@ -2,10 +2,12 @@ package dev.demir.vulkan;
 
 import dev.demir.vulkan.engine.VulkanEngine;
 import dev.demir.vulkan.renderer.FrameData;
-import dev.demir.vulkan.renderer.SceneBuilder;
 import dev.demir.vulkan.scene.Camera;
+import dev.demir.vulkan.scene.MeshData;
+import dev.demir.vulkan.scene.MeshLibrary;
 import dev.demir.vulkan.scene.ModelInstance;
 import dev.demir.vulkan.scene.Scene;
+import dev.demir.vulkan.scene.SceneDescription;
 import dev.demir.vulkan.util.Vec3;
 import org.lwjgl.system.Configuration;
 
@@ -21,7 +23,8 @@ import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferByte;
 import java.io.File;
 import java.nio.ByteBuffer;
-import java.util.Objects;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -70,7 +73,7 @@ public class VulkanApp {
     // --- Engine Core ---
     private final AtomicReference<FrameData> latestFrame = new AtomicReference<>();
     private final VulkanEngine vulkanEngine;
-    private final SceneBuilder sceneBuilder = new SceneBuilder();
+    private final MeshLibrary meshLibrary = new MeshLibrary();
     private final Camera camera;
     private final Scene scene = new Scene();
 
@@ -80,6 +83,7 @@ public class VulkanApp {
 
     // --- 3-THREAD-FIX: This flag pauses accumulation in updateUI() ---
     private volatile boolean sceneBuildInProgress = false;
+    private boolean rebuildRequested = false; // UI thread only: an edit arrived during a rebuild
 
     // Set (on the UI thread) when the render thread has crashed; stops the FPS title updates.
     private boolean renderEngineStopped = false;
@@ -150,7 +154,7 @@ public class VulkanApp {
 
     public void run() {
         // 1. Set up Swing UI
-        frame = new JFrame("Vulkan BVH Ray Tracer");
+        frame = new JFrame("Vulkan Ray Tracer");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         bufferedImage = new BufferedImage(RENDER_WIDTH, RENDER_HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
         imageLabel = new JLabel(new ImageIcon(bufferedImage));
@@ -258,73 +262,64 @@ public class VulkanApp {
                 "Render Engine Error", JOptionPane.ERROR_MESSAGE);
     }
 
+    /** Instance values captured on the UI thread, so the rebuild thread never reads live UI objects. */
+    private record InstanceSpec(String modelPath, String name, float[] transform, float[] albedo, float materialType) {
+    }
+
     /**
-     * Assigns a scene build task to the SceneBuilder (SRT).
-     * (3-THREAD-FIX): This now controls the sceneBuildInProgress flag
-     * and handles resetting the camera *after* the build.
+     * Rebuilds the scene in the background (SRT): loads any new model files (cached by
+     * MeshLibrary) and hands an immutable SceneDescription to the render thread, which
+     * then only has to build BLASes for new meshes and rebuild the TLAS.
+     * A request that arrives while a rebuild runs is remembered and run right after.
      */
     public void rebuildSceneAsync() {
-        String logPrefix = "LOG (UI-REBUILD): ";
-
         if (sceneBuildInProgress) {
-            System.out.println(logPrefix + "Scene build already in progress. Ignoring trigger.");
+            rebuildRequested = true;
             return;
         }
+        sceneBuildInProgress = true; // pauses accumulation in updateUI()
+        rebuildRequested = false;
 
-        // 1. Set flag to TRUE to pause accumulation in updateUI()
-        sceneBuildInProgress = true;
+        List<InstanceSpec> specs = new ArrayList<>();
+        for (ModelInstance instance : scene.getInstances()) {
+            Vec3 color = instance.getColor();
+            specs.add(new InstanceSpec(instance.getModelPath(), instance.getDisplayName(), instance.toTransform3x4(),
+                    new float[]{(float) color.x, (float) color.y, (float) color.z}, instance.getMaterialType()));
+        }
 
-        System.out.println(logPrefix + "Triggering asynchronous scene build (SRT)...");
-        System.out.println(logPrefix + "Accumulation is PAUSED.");
-
-        // --- 3-THREAD-FIX: MOVE RESET TO END ---
-        // Do NOT reset the camera here. If we do, updateUI()
-        // will increment frameCount while the SRT is running.
-        // We move the reset logic into the .whenCompleteAsync block.
-        // --- END FIX ---
-
-
-        final Scene sceneSnapshot = scene.createSnapshot();
         CompletableFuture
-                .supplyAsync(() -> sceneBuilder.buildScene(sceneSnapshot))
-                .whenCompleteAsync((builtCpuData, error) -> {
-                    // This block runs on the UI Thread (thanks to SwingUtilities::invokeLater)
-                    String logPrefixDone = "LOG (UI-SRT-DONE): ";
-
+                .supplyAsync(() -> loadSceneDescription(specs))
+                .whenCompleteAsync((description, error) -> {
                     if (error != null) {
                         error.printStackTrace();
-                        JOptionPane.showMessageDialog(frame, "Scene build failed: " + error.getMessage(), "SRT Error", JOptionPane.ERROR_MESSAGE);
+                        JOptionPane.showMessageDialog(frame, "Scene build failed: " + error.getMessage(),
+                                "Scene Error", JOptionPane.ERROR_MESSAGE);
                     } else {
-                        System.out.println(logPrefixDone + "SRT finished. Sending new scene to VRT...");
-
-                        // 1. Send the new scene data to the VRT.
-                        //    (VulkanEngine's submitScene is now "dumb" and doesn't reset)
-                        vulkanEngine.submitScene(builtCpuData);
-                        System.out.println(logPrefixDone + "submitScene() called.");
-
-
-                        // --- 3-THREAD-FIX: RESET CAMERA *AFTER* BUILD ---
-                        // 2. Now that the scene is submitted, reset the camera
-                        //    (frameCount = 0) on the UI thread.
+                        vulkanEngine.submitScene(description);
+                        // Reset accumulation now that the new scene is on its way to the render thread.
                         camera.resetAccumulation();
-                        System.out.println(logPrefixDone + "camera.resetAccumulation() called. frameCount is now 0.");
-
-                        // 3. Send the current sky state AND the reset (frameCount=0)
-                        //    to the VRT. This ensures the VRT's *next* frame
-                        //    is the new scene with frame 0.
-                        boolean isSkyEnabled = enableSkyCheckBox.isSelected();
-                        vulkanEngine.submitSkyToggle(isSkyEnabled);
+                        vulkanEngine.submitSkyToggle(enableSkyCheckBox.isSelected());
                         vulkanEngine.submitCameraUpdate(camera);
-                        System.out.println(logPrefixDone + "submitSkyToggle(" + isSkyEnabled + ") and submitCameraUpdate(fc=0) called.");
-                        // --- END FIX ---
                     }
-
-                    // 4. Finally, set flag to FALSE to re-enable
-                    //    accumulation (incrementFrameCount) in updateUI().
                     sceneBuildInProgress = false;
-                    System.out.println(logPrefixDone + "Accumulation is RESUMED.");
-
+                    if (rebuildRequested) {
+                        rebuildSceneAsync();
+                    }
                 }, SwingUtilities::invokeLater);
+    }
+
+    /** Runs on the rebuild thread: resolves meshes (loading new files) and skips models that fail to load. */
+    private SceneDescription loadSceneDescription(List<InstanceSpec> specs) {
+        List<SceneDescription.Instance> instances = new ArrayList<>();
+        for (InstanceSpec spec : specs) {
+            try {
+                MeshData mesh = meshLibrary.get(spec.modelPath());
+                instances.add(new SceneDescription.Instance(mesh, spec.transform(), spec.albedo(), spec.materialType()));
+            } catch (RuntimeException e) {
+                System.err.println("WARN (SRT): Skipping '" + spec.name() + "': " + e.getMessage());
+            }
+        }
+        return new SceneDescription(instances);
     }
 
     /**

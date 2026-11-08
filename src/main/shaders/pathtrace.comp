@@ -1,52 +1,47 @@
-#version 450
-
-precision highp float; // ES portu/alışkanlık için bırakıldı
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 /*
- * Phase 3: Gerçek Path Tracing Motoru
+ * Path tracer using hardware ray tracing (RT cores) through ray queries.
+ * The scene is a top-level acceleration structure (TLAS) over instances; each instance
+ * points at a mesh BLAS. Per-instance data (mesh buffers, material) lives in InstanceBuffer.
  */
 
-// --- Structs (Veri Yapıları) ---
-struct Vertex { vec3 pos; float pad; };
-struct Material { vec3 albedo; float type; }; // type: 0=Lambertian, 1=Metal, 2=FuzzyMetal
+// --- Data layout (must match RayTracingScene.java / VulkanEngine.java) ---
 struct Ray { vec3 origin; vec3 dir; };
-struct LinearBVHNode {
-    vec3 bbox_min; float pad1;
-    vec3 bbox_max; float pad2;
-    int data;
-    int count;
+
+struct InstanceInfo {
+    uint64_t vertexAddress;   // float x, y, z per vertex (object space)
+    uint64_t indexAddress;    // uint, three per triangle
+    vec4     albedoAndType;   // rgb = albedo, a = material type
 };
 
-// --- BINDINGS (Veri Bağlantıları) ---
-layout(rgba8, set = 0, binding = 0) uniform restrict writeonly image2D resultImage;
-layout(std430, set = 0, binding = 1) buffer TriangleBuffer { Vertex vertices[]; } triBuf;
-layout(std430, set = 0, binding = 2) buffer MaterialBuffer { Material materials[]; } matBuf;
-layout(std430, set = 0, binding = 3) buffer BVHBuffer { LinearBVHNode nodes[]; } bvhBuf;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Positions { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Indices { uint i[]; };
 
-layout(std140, set = 0, binding = 4) uniform CameraUBO {
+// --- Bindings ---
+layout(rgba8, set = 0, binding = 0) uniform restrict writeonly image2D resultImage;
+layout(set = 0, binding = 1) uniform accelerationStructureEXT topLevelAS;
+layout(std430, set = 0, binding = 2) readonly buffer InstanceBuffer { InstanceInfo instances[]; };
+layout(std140, set = 0, binding = 3) uniform CameraUBO {
     vec3 origin;
-// 4 byte padding (std140'da vec3 -> 16 byte align)
     vec3 lower_left_corner;
-// 4 byte padding
     vec3 horizontal;
-// 4 byte padding
     vec3 vertical;
 } cam;
 
-// --- Push Constants ---
-layout(push_constant) uniform Constants {
-    int numTriangles;
-} constants;
-
-// --- Sabitler ---
+// --- Constants ---
 const float T_MIN = 0.001;
 const float T_MAX = 10000.0;
-const int   MAX_BOUNCES = 10; // Işın sekme limiti
-const float MAT_LAMBERTIAN = 0.0;
-const float MAT_METAL      = 1.0;
-const float MAT_METAL_FUZZY= 2.0;
+const int   MAX_BOUNCES = 10;
+const float MAT_LAMBERTIAN  = 0.0;
+const float MAT_METAL       = 1.0;
+const float MAT_METAL_FUZZY = 2.0;
+const float MAT_EMISSIVE    = 3.0;
 
-// --- Rastgele Sayı Üretici (RNG) ---
+// --- Random numbers (PCG hash) ---
 uint seed;
 
 uint pcg(uint v) {
@@ -61,21 +56,14 @@ float randomFloat() {
 }
 
 vec3 randomVec3InUnitSphere() {
-    vec3 temp = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
-    for(;;) {
+    for (;;) {
         vec3 p = vec3(randomFloat(), randomFloat(), randomFloat()) * 2.0 - 1.0;
         if (dot(p, p) < 1.0) return p;
     }
-    return temp;
 }
 
 vec3 randomUnitVector() {
     return normalize(randomVec3InUnitSphere());
-}
-
-// --- Yardımcı Fonksiyonlar ---
-vec3 ray_at(Ray r, float t) {
-    return r.origin + r.dir * t;
 }
 
 vec3 getSkyColor(Ray r) {
@@ -84,154 +72,115 @@ vec3 getSkyColor(Ray r) {
     return (1.0 - t) * vec3(1.0) + t * vec3(0.5, 0.7, 1.0);
 }
 
-// --- Çarpışma Testleri ---
-bool hit_aabb(Ray r, vec3 bbox_min, vec3 bbox_max, float t_min, float t_max) {
-    vec3 invDir = 1.0 / r.dir;
-    vec3 t0s = (bbox_min - r.origin) * invDir;
-    vec3 t1s = (bbox_max - r.origin) * invDir;
-    vec3 tmin = min(t0s, t1s);
-    vec3 tmax = max(t0s, t1s);
+// --- Hit information from the committed ray-query intersection ---
+struct Hit {
+    float t;
+    vec3  normal;    // world space, facing against the ray
+    vec4  material;  // rgb = albedo, a = type
+};
 
-    // İç içe max/min çağrılarını ayır
-    float t_enter = max(tmin.x, tmin.y);
-    t_enter = max(t_enter, tmin.z);
-
-    float t_exit = min(tmax.x, tmax.y);
-    t_exit = min(t_exit, tmax.z);
-
-    return t_exit > t_enter && t_exit > t_min && t_enter < t_max;
-}
-
-bool hit_triangle(Ray r, vec3 v0, vec3 v1, vec3 v2, inout float closest_t, out vec3 hit_normal) {
-    vec3 edge1 = v1 - v0;
-    vec3 edge2 = v2 - v0;
-    vec3 ray_cross_e2 = cross(r.dir, edge2);
-    float det = dot(edge1, ray_cross_e2);
-    if (det > -0.00001 && det < 0.00001) return false;
-
-    float inv_det = 1.0 / det;
-    vec3 s = r.origin - v0;
-    float u = inv_det * dot(s, ray_cross_e2);
-    if (u < 0.0 || u > 1.0) return false;
-
-    vec3 s_cross_e1 = cross(s, edge1);
-    float v = inv_det * dot(r.dir, s_cross_e1);
-    if (v < 0.0 || (u + v) > 1.0) return false;
-
-    float t = inv_det * dot(edge2, s_cross_e1);
-    if (t > T_MIN && t < closest_t) {
-        closest_t = t;
-        hit_normal = normalize(cross(edge1, edge2));
-        if (dot(r.dir, hit_normal) > 0.0) hit_normal = -hit_normal;
-        return true;
+bool traceRay(Ray r, out Hit hit) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, r.origin, T_MIN, r.dir, T_MAX);
+    while (rayQueryProceedEXT(query)) {
+        // All geometry is opaque, so the hardware commits the closest triangle by itself.
     }
-    return false;
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    InstanceInfo instance = instances[rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)];
+    int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+
+    Indices indices = Indices(instance.indexAddress);
+    Positions positions = Positions(instance.vertexAddress);
+    uint i0 = indices.i[3 * primitive];
+    uint i1 = indices.i[3 * primitive + 1];
+    uint i2 = indices.i[3 * primitive + 2];
+    vec3 v0 = vec3(positions.v[3 * i0], positions.v[3 * i0 + 1], positions.v[3 * i0 + 2]);
+    vec3 v1 = vec3(positions.v[3 * i1], positions.v[3 * i1 + 1], positions.v[3 * i1 + 2]);
+    vec3 v2 = vec3(positions.v[3 * i2], positions.v[3 * i2 + 1], positions.v[3 * i2 + 2]);
+
+    // Object-space face normal to world space: n_world = transpose(inverse(M)) * n = n * WorldToObject.
+    vec3 objectNormal = cross(v1 - v0, v2 - v0);
+    mat4x3 worldToObject = rayQueryGetIntersectionWorldToObjectEXT(query, true);
+    vec3 normal = normalize((objectNormal * worldToObject).xyz);
+    if (dot(r.dir, normal) > 0.0) normal = -normal;
+
+    hit.t = rayQueryGetIntersectionTEXT(query, true);
+    hit.normal = normal;
+    hit.material = instance.albedoAndType;
+    return true;
 }
 
-// --- Materyal (Scatter) Fonksiyonu ---
-bool scatter(Ray r_in, int mat_index, vec3 hit_pos, vec3 hit_normal,
-out vec3 attenuation, out Ray scattered) {
+// --- Materials ---
+bool scatter(Ray r_in, vec4 material, vec3 hit_pos, vec3 hit_normal,
+             out vec3 attenuation, out Ray scattered) {
+    vec3 albedo = material.rgb;
+    float type = material.a;
 
-    Material mat = matBuf.materials[mat_index];
-
-    if (mat.type == MAT_LAMBERTIAN) {
+    if (type == MAT_LAMBERTIAN) {
         vec3 scatter_direction = hit_normal + randomUnitVector();
         if (length(scatter_direction) < 0.0001) scatter_direction = hit_normal;
         scattered   = Ray(hit_pos, normalize(scatter_direction));
-        attenuation = mat.albedo;
+        attenuation = albedo;
         return true;
     }
 
-    if (mat.type == MAT_METAL || mat.type == MAT_METAL_FUZZY) {
-        float fuzz    = (mat.type == MAT_METAL_FUZZY) ? 0.3 : 0.0;
-        vec3 reflected= reflect(normalize(r_in.dir), hit_normal); // yerleşik reflect kullanılıyor
-        scattered     = Ray(hit_pos, normalize(reflected + fuzz * randomVec3InUnitSphere()));
-        attenuation   = mat.albedo;
+    if (type == MAT_METAL || type == MAT_METAL_FUZZY) {
+        float fuzz     = (type == MAT_METAL_FUZZY) ? 0.3 : 0.0;
+        vec3 reflected = reflect(normalize(r_in.dir), hit_normal);
+        scattered      = Ray(hit_pos, normalize(reflected + fuzz * randomVec3InUnitSphere()));
+        attenuation    = albedo;
         return (dot(scattered.dir, hit_normal) > 0.0);
     }
 
-    return false; // Bilinmeyen materyal
+    return false; // emissive and unknown materials do not scatter
 }
 
-// --- ANA SHADER (MAIN) ---
+// --- Main ---
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
     ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 image_size   = imageSize(resultImage);
     if (pixel_coords.x >= image_size.x || pixel_coords.y >= image_size.y) return;
 
-    // RNG Seed
-    seed = (pixel_coords.y * image_size.x + pixel_coords.x);
+    seed = uint(pixel_coords.y * image_size.x + pixel_coords.x);
 
-    // Anti-Aliasing (Y-flip ile)
+    // Anti-aliasing jitter, with the image flipped vertically
     float u = (float(pixel_coords.x) + randomFloat()) / float(image_size.x);
     float v = (float(image_size.y - 1 - pixel_coords.y) + randomFloat()) / float(image_size.y);
 
-    // Kamera Işını
     Ray r;
     r.origin = cam.origin;
     r.dir = normalize(cam.lower_left_corner + cam.horizontal * u + cam.vertical * v - cam.origin);
 
-    // Path Tracing
     vec3 final_color = vec3(0.0);
     vec3 attenuation = vec3(1.0);
 
     for (int b = 0; b < MAX_BOUNCES; b++) {
-
-        float closest_t = T_MAX;
-        int   hit_triangle_index = -1;
-        vec3  hit_normal = vec3(0.0);
-
-        int stack[64];
-        int stackPtr = 0;
-        stack[stackPtr++] = 0; // root
-
-        while (stackPtr > 0) {
-            int nodeIndex = stack[--stackPtr];
-            LinearBVHNode node = bvhBuf.nodes[nodeIndex];
-
-            if (hit_aabb(r, node.bbox_min, node.bbox_max, T_MIN, closest_t)) {
-                if (node.count < 0) { // yaprak
-                    int triangleIndex = -(node.data + 1);
-                    vec3 v0 = triBuf.vertices[triangleIndex * 3 + 0].pos;
-                    vec3 v1 = triBuf.vertices[triangleIndex * 3 + 1].pos;
-                    vec3 v2 = triBuf.vertices[triangleIndex * 3 + 2].pos;
-
-                    vec3 temp_normal;
-                    if (hit_triangle(r, v0, v1, v2, closest_t, temp_normal)) {
-                        hit_triangle_index = triangleIndex;
-                        hit_normal = temp_normal;
-                    }
-                } else { // iç düğüm
-                    stack[stackPtr++] = node.count; // right
-                    stack[stackPtr++] = node.data;  // left
-                }
-            }
-        }
-
-        if (hit_triangle_index != -1) {
-            vec3 hit_pos = ray_at(r, closest_t);
-            vec3 mat_attenuation;
-            Ray  scattered_ray;
-
-            if (scatter(r, hit_triangle_index, hit_pos, hit_normal, mat_attenuation, scattered_ray)) {
-                attenuation *= mat_attenuation;
-                r = scattered_ray;
-            } else {
-                attenuation = vec3(0.0);
-                break;
-            }
-        } else {
+        Hit hit;
+        if (!traceRay(r, hit)) {
             final_color = attenuation * getSkyColor(r);
             break;
         }
 
-        if (b == MAX_BOUNCES - 1) {
-            final_color = vec3(0.0);
+        if (hit.material.a == MAT_EMISSIVE) {
+            final_color = attenuation * hit.material.rgb;
+            break;
         }
+
+        vec3 hit_pos = r.origin + r.dir * hit.t;
+        vec3 mat_attenuation;
+        Ray scattered;
+        if (!scatter(r, hit.material, hit_pos, hit.normal, mat_attenuation, scattered)) {
+            break; // absorbed: final_color stays black
+        }
+        attenuation *= mat_attenuation;
+        r = scattered;
+        // A path still bouncing after MAX_BOUNCES contributes nothing (final_color stays black).
     }
 
-    // Renk Yazma (Gamma ~ sqrt)
-    final_color = sqrt(final_color);
-    imageStore(resultImage, pixel_coords, vec4(final_color, 1.0));
+    // Gamma ~2 (sqrt)
+    imageStore(resultImage, pixel_coords, vec4(sqrt(final_color), 1.0));
 }

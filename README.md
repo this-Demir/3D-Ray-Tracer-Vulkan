@@ -9,7 +9,7 @@
 
 A high-performance, real-time **GPU Ray Tracer** written in Java using **LWJGL** and **Vulkan**.
 
-This project, developed as a **Software Engineering Student Project**, demonstrates a robust, multi-threaded architecture capable of rendering complex 3D scenes. It utilizes a custom CPU-built **Bounding Volume Hierarchy (BVH)** to achieve O(log n) ray intersection on the GPU, allowing for real-time performance even on integrated graphics.
+This project, developed as a **Software Engineering Student Project**, demonstrates a robust, multi-threaded architecture capable of rendering complex 3D scenes. It uses the GPU's **hardware ray tracing units (RT cores)** through Vulkan ray queries: the driver builds the acceleration structures on the GPU, and a compute shader path-traces the scene against them. (Earlier versions used a custom CPU-built BVH traversed in the shader; see the [development log](DEVELOPMENT_LOG.md).)
 
 ### [➔Click here to visit the Render Gallery ](GALLERY.md)
 
@@ -17,12 +17,12 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 ![Ray Tracer Demo](render_images/car-render-ss.png)
 ##  Key Features
 
-* **Real-Time GPU Rendering:** Uses Vulkan Compute Shaders (`.comp`) for massive parallel ray tracing.
-* **BVH Acceleration:** Implements a Linear BVH structure built on the CPU and flattened for GPU traversal, allowing rendering of meshes with 50k+ triangles efficiently.
+* **Hardware Ray Tracing:** A Vulkan compute shader traces rays with `rayQueryEXT` against a top-level acceleration structure (TLAS) of instances, each pointing at a per-mesh bottom-level structure (BLAS). Traversal and triangle tests run on the RT cores.
+* **Instancing:** Each model file becomes one BLAS in VRAM, shared by every copy in the scene. Moving, scaling or recoloring objects only rebuilds the TLAS (a few milliseconds).
 * **Multi-Threaded Architecture:**
     * **UI Thread:** Responsive Swing Interface (never freezes).
-    * **Vulkan Render Thread (VRT):** Dedicated rendering loop managing command queues.
-    * **Scene Rebuild Thread (SRT):** Asynchronous BVH construction for non-blocking scene editing.
+    * **Vulkan Render Thread (VRT):** Dedicated rendering loop; the only thread that makes Vulkan calls.
+    * **Scene Rebuild Thread (SRT):** Loads new model files in the background (cached per file) for non-blocking scene editing.
 * **Interactive Editor:**
     * Add/Remove `.obj` models dynamically.
     * Modify object **Position**, **Scale**, and **Color** in real-time.
@@ -31,26 +31,31 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 
 ##  System & Performance
 
-This engine is highly optimized to run efficiently without requiring high-end dedicated hardware.
-
 **Tested System Specs:**
-* **OS:** Windows 11 Home Single Language 64-bit
-* **CPU:** 13th Gen Intel(R) Core(TM) i9-13900H
-* **GPU:** Intel(R) Iris(R) Xe Graphics (Integrated)
-* **RAM:** 16GB
+* **OS:** Windows 11 Pro
+* **CPU:** AMD Ryzen 5 7600X
+* **GPU:** NVIDIA GeForce RTX 5060 Ti (16 GB)
+* **RAM:** 48 GB
 
-> **Performance Note:** Despite running on an integrated GPU (no external graphics card), the application maintains a stable **~40 FPS** in complex scenes. This demonstrates the efficiency of the BVH acceleration structure and memory management.
+**Measured GPU time per frame** (1280×720, 1 sample per pixel, up to 10 bounces):
+
+| Scene | Previous CPU-built BVH | Hardware ray tracing |
+|---|---|---|
+| ~49k triangles | 29 ms | 0.6 ms |
+| ~1M triangles (20 instanced meshes) | 1129 ms | 0.7 ms |
+
+Building the acceleration structures for the default scene takes about 17 ms on the GPU (the CPU BVH took 0.4 s). The frame rate (~120 FPS) is currently limited by copying each frame back to the CPU for the Swing window, not by ray tracing.
 
 ##  Architecture Overview
 
-The application is built on a "Decoupled Rendering" model to ensure the UI remains responsive even during heavy computation like BVH construction.
+The application is built on a "Decoupled Rendering" model to ensure the UI remains responsive even while models are loading.
 
 ```mermaid
 graph TD
     User[User Input] --> UI[Swing UI Thread]
     UI -- "Camera Updates" --> Q1[Camera Queue]
     UI -- "Scene Changes" --> SRT[Scene Rebuild Thread]
-    SRT -- "Built BVH & Buffers" --> Q2[Scene Queue]
+    SRT -- "Loaded meshes + instances" --> Q2[Scene Queue]
     
     subgraph VRT [Vulkan Render Thread]
         Loop[Render Loop]
@@ -78,10 +83,10 @@ graph TD
 ##  Technical Details
 
 * **Language:** Java 21
-* **Graphics API:** Vulkan 1.0+ compute (via LWJGL 3.3.6)
-* **Shading Language:** GLSL 4.50
-* **Acceleration Structure:** Linear Bounding Volume Hierarchy (LBVH) built on CPU.
-* **Synchronization:** Explicit memory barriers and layout transitions (General <-> Transfer) to manage resource synchronization between Compute and Transfer queues.
+* **Graphics API:** Vulkan 1.2 with `VK_KHR_acceleration_structure` and `VK_KHR_ray_query` (via LWJGL 3.3.6)
+* **Shading Language:** GLSL 4.60 (`GL_EXT_ray_query`, `GL_EXT_buffer_reference`), compiled to SPIR-V with shaderc at build time.
+* **Acceleration Structures:** One BLAS per mesh (vertex and index buffers in VRAM, read in the shader through buffer device addresses), one TLAS over all instances, both built on the GPU by the driver.
+* **Synchronization:** Explicit memory barriers and layout transitions (General <-> Transfer) between the compute pass and the copy of the frame to the CPU.
 
 ##  Build & Run
 

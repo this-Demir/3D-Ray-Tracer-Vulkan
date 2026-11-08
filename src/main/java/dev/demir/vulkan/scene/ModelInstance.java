@@ -18,9 +18,8 @@ public class ModelInstance {
 
     // Dönüşüm (Transform) bilgileri
     private Vec3 position;
+    private Vec3 rotation; // Euler angles in degrees, applied X, then Y, then Z
     private Vec3 scale;
-    // Not: Rotasyon (Dönüş) daha karmaşık matrisler gerektirdiğinden
-    // şimdilik atlıyoruz, varsayılan (0,0,0) olacak.
 
     // Materyal bilgileri
     private Vec3 color;
@@ -37,6 +36,7 @@ public class ModelInstance {
 
         // Varsayılan değerleri ayarla
         this.position = new Vec3(0, 0, 0);
+        this.rotation = new Vec3(0, 0, 0);
         this.scale = new Vec3(1, 1, 1);
         this.color = new Vec3(0.8, 0.8, 0.8); // Varsayılan gri
         this.materialType = 0.0f; // 0.0f = Diffuse (Mat)
@@ -47,6 +47,7 @@ public class ModelInstance {
     public String getDisplayName() { return displayName; }
     public String getModelPath() { return modelPath; }
     public Vec3 getPosition() { return position; }
+    public Vec3 getRotation() { return rotation; }
     public Vec3 getScale() { return scale; }
     public Vec3 getColor() { return color; }
     public float getMaterialType() { return materialType; }
@@ -55,9 +56,37 @@ public class ModelInstance {
 
     public void setDisplayName(String displayName) { this.displayName = displayName; }
     public void setPosition(Vec3 position) { this.position = position; }
+    public void setRotation(Vec3 rotation) { this.rotation = rotation; }
     public void setScale(Vec3 scale) { this.scale = scale; }
     public void setColor(Vec3 color) { this.color = color; }
     public void setMaterialType(float materialType) { this.materialType = materialType; }
+
+    /**
+     * Object-to-world transform as a row-major 3x4 matrix (the layout Vulkan's
+     * VkTransformMatrixKHR expects): M = Translate * Rz * Ry * Rx * Scale.
+     */
+    public float[] toTransform3x4() {
+        double ax = Math.toRadians(rotation.x), ay = Math.toRadians(rotation.y), az = Math.toRadians(rotation.z);
+        double cx = Math.cos(ax), sx = Math.sin(ax);
+        double cy = Math.cos(ay), sy = Math.sin(ay);
+        double cz = Math.cos(az), sz = Math.sin(az);
+        // R = Rz * Ry * Rx
+        double[][] r = {
+                {cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx},
+                {sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx},
+                {-sy,     cy * sx,                cy * cx}
+        };
+        double[] s = {scale.x, scale.y, scale.z};
+        double[] t = {position.x, position.y, position.z};
+        float[] m = new float[12];
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                m[row * 4 + col] = (float) (r[row][col] * s[col]);
+            }
+            m[row * 4 + 3] = (float) t[row];
+        }
+        return m;
+    }
 
     /**
      * JList'te düzgün görünmesi için.

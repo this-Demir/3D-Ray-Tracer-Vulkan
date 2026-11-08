@@ -4,8 +4,7 @@ import java.nio.ByteBuffer;
 
 /**
  * Represents a 3D Vector or Point.
- * This is a clean re-implementation of the logic from 'raytracer-java/core/Vec3.java'
- * to be used by the CPU-side BVH builder.
+ * Based on 'raytracer-java/core/Vec3.java'; used for camera and transform math.
  *
  * NOTE: This class is for CPU-side math only.
  * The equivalent logic in GLSL is the built-in 'vec3' type.
@@ -100,16 +99,6 @@ public class Vec3 {
                 Math.max(a.y, b.y),
                 Math.max(a.z, b.z)
         );
-    }
-
-    /**
-     * Helper to get a component by index (0=x, 1=y, 2=z).
-     * Used by the BVH builder for sorting along axes.
-     */
-    public double get(int axis) {
-        if (axis == 0) return x;
-        if (axis == 1) return y;
-        return z;
     }
 
     @Override
