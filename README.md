@@ -14,7 +14,12 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 ### [➔Click here to visit the Render Gallery ](GALLERY.md)
 
 
-![Ray Tracer Demo](render_images/car-render-ss.png)
+<p align="center">
+  <img src="render_images/rt/black-hole.jpg" width="49%" alt="Black hole with accretion disk" />
+  <img src="render_images/rt/neutron-star.jpg" width="49%" alt="Neutron star with magnetic field lines and pulsar beams" />
+</p>
+<p align="center"><sub>Light bent by gravity, traced on the RT cores: a black hole with its accretion disk (left) and a spinning neutron star with its magnetic field (right).</sub></p>
+
 ##  Key Features
 
 * **Hardware Ray Tracing:** A Vulkan compute shader traces rays with `rayQueryEXT` against a top-level acceleration structure (TLAS) of instances, each pointing at a bottom-level structure (BLAS). Traversal and triangle tests run on the RT cores.
@@ -32,19 +37,19 @@ This project, developed as a **Software Engineering Student Project**, demonstra
 
 ##  Scenes
 
-| Mirror Room | Eclipse |
+| Black Hole | Black Hole without gravity |
 |---|---|
-| ![Mirror Room](render_images/rt/mirror-room.jpg) | ![Eclipse](render_images/rt/eclipse.jpg) |
-| A closed room with mirror walls and one small lamp: 30 bounces of reflections. | A sun, planets and a moon. The moon orbits Earth; once per orbit its shadow falls on Earth (shadow rays towards the sun). |
-| **ShowRoom** | **Custom** |
-| ![ShowRoom](render_images/rt/showroom.jpg) | ![Custom](render_images/rt/custom.jpg) |
-| Models on a platform in front of a mirror wall, lit by the sky. The airplane can turn like on a display turntable. | A ground plane and a figure: the starting point for your own scene. |
-| **Black Hole** | **Black Hole without gravity** |
 | ![Black Hole](render_images/rt/black-hole.jpg) | ![No gravity](render_images/rt/black-hole-no-gravity.jpg) |
 | Light bent around a Schwarzschild black hole: the far side of the accretion disk shows above and below the shadow, a planet hidden behind the hole appears as Einstein arcs, the approaching side of the disk is brighter (Doppler beaming). See [docs/black-hole.md](docs/black-hole.md) for the physics and its verification. | The same scene with straight light rays, for comparison: the horizon is a black sphere and the planet behind it is hidden. |
 | **Neutron Star** | **Neutron Star, diagnostic split view** |
 | ![Neutron Star](render_images/rt/neutron-star.jpg) | ![Split view](render_images/rt/neutron-star-split.jpg) |
 | A spinning neutron star (1.4 solar masses, 12 km): hot surface and polar caps, corona, magnetic field lines and pulsar beams, all seen through bent light. See [docs/neutron-star.md](docs/neutron-star.md). | Diagnostic view, left half straight light, right half bent light: the star looks 20 % larger, redshifted, and shows its far side (orange: 75.5 % of the surface is visible instead of half). |
+| **Mirror Room** | **Eclipse** |
+| ![Mirror Room](render_images/rt/mirror-room.jpg) | ![Eclipse](render_images/rt/eclipse.jpg) |
+| A closed room with mirror walls and one small lamp: 30 bounces of reflections. | A sun, planets and a moon. The moon orbits Earth; once per orbit its shadow falls on Earth (shadow rays towards the sun). |
+| **ShowRoom** | **Custom** |
+| ![ShowRoom](render_images/rt/showroom.jpg) | ![Custom](render_images/rt/custom.jpg) |
+| Models on a platform in front of a mirror wall, lit by the sky. The airplane can turn like on a display turntable. | A ground plane and a figure: the starting point for your own scene. |
 
 ##  System & Performance
 
