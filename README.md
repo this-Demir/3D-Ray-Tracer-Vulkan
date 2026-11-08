@@ -77,8 +77,8 @@ graph TD
 
 ##  Technical Details
 
-* **Language:** Java 17+
-* **Graphics API:** Vulkan 1.2+ (via LWJGL 3)
+* **Language:** Java 21
+* **Graphics API:** Vulkan 1.0+ compute (via LWJGL 3.3.6)
 * **Shading Language:** GLSL 4.50
 * **Acceleration Structure:** Linear Bounding Volume Hierarchy (LBVH) built on CPU.
 * **Synchronization:** Explicit memory barriers and layout transitions (General <-> Transfer) to manage resource synchronization between Compute and Transfer queues.
@@ -86,18 +86,21 @@ graph TD
 ##  Build & Run
 
 ### Prerequisites
-* **Java:** JDK 17 or higher.
-* **Vulkan:** A Vulkan-capable GPU and the **Vulkan Runtime/SDK** installed on your system.
-* **Build Tool:** Maven or Gradle (depending on project setup).
+* **Java:** JDK 21.
+* **Vulkan:** A Vulkan-capable GPU. The Vulkan runtime comes with the GPU driver; the Vulkan SDK is only needed for validation layers.
+* **Build Tool:** None to install. The project uses the Gradle wrapper, which downloads Gradle and LWJGL on the first build.
 
 ### Running
-1.  Clone the repository.
-2.  Ensure shader binaries (`.spv`) are compiled in `shaders_spv/`.
-3.  Run the main class:
-    ```bash
-    # Run via IDE or Jar
-    java -jar target/ray-tracer-vulkan.jar
-    ```
+```bash
+./gradlew run          # Windows (cmd/PowerShell): gradlew run
+```
+
+Compiled shaders are committed in `shaders_spv/`, and the default scene uses models from `objects/`.
+To turn on Vulkan validation (requires the Vulkan SDK), run `./gradlew run -Dvulkan.validation=true`.
+
+To get a standalone build: `./gradlew installDist`, then start `build/install/ray-tracer-vulkan/bin/ray-tracer-vulkan` from the repository root (shaders and models are loaded relative to the working directory).
+
+In IntelliJ IDEA, open the folder and let it import the Gradle project.
 
 ##  Development Log
 

@@ -1,0 +1,9 @@
+# Shell scripts must keep LF, Windows scripts CRLF, regardless of core.autocrlf.
+gradlew text eol=lf
+*.sh    text eol=lf
+*.bat   text eol=crlf
+
+*.jar   binary
+*.spv   binary
+*.png   binary
+*.mp4   binary

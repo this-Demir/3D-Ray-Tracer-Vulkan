@@ -34,3 +34,11 @@ bin/
 objects/car.obj
 objects/Female.obj
 objects/sun.obj
+### Gradle ###
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+### IntelliJ (project model comes from Gradle) ###
+.idea/
+*.iml
