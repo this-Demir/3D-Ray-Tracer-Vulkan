@@ -1,4 +1,4 @@
-package dev.demir.vulkan.engine;
+package dev.demir.vulkan.scene;
 
 /**
  * Global render settings, sent from the UI to the render thread. Changing any of them restarts accumulation.

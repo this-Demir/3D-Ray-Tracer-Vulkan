@@ -3,94 +3,90 @@ package dev.demir.vulkan.scene;
 import dev.demir.vulkan.util.Vec3;
 
 /**
- * Gelişmiş Phase 1: Sahne Nesnesi Modeli
- * Bu sınıf, sahnemizdeki tek bir nesnenin (bir .obj modelinin
- * bir "örneği" - instance'ı) tüm durumunu tutar.
- * Hangi modelin, nerede, ne boyutta ve ne renk olduğunu tanımlar.
+ * One object in the editable scene: which geometry (a model file or a built-in primitive),
+ * where it is (position, rotation, scale) and what it is made of (material).
+ * Owned and mutated by the UI thread; the renderer only sees immutable snapshots.
  */
 public class ModelInstance {
 
-    // UI'da (örn. JList) gösterilecek isim
     private String displayName;
+    private final String modelPath; // file path, or SphereGeometry.KEY for the analytic sphere
 
-    // Yüklenecek .obj dosyasının yolu
-    private final String modelPath;
-
-    // Dönüşüm (Transform) bilgileri
-    private Vec3 position;
-    private Vec3 rotation; // Euler angles in degrees, applied X, then Y, then Z
-    private Vec3 scale;
-
-    // Materyal bilgileri
-    private Vec3 color;
-    private float materialType;
+    private Vec3 position = new Vec3(0, 0, 0);
+    private Vec3 rotation = new Vec3(0, 0, 0); // Euler angles in degrees, applied X, then Y, then Z
+    private Vec3 scale = new Vec3(1, 1, 1);
+    private Material material = Material.diffuse(0.8f, 0.8f, 0.8f);
 
     /**
-     * Yeni bir model nesnesi oluşturur.
-     * @param modelPath .obj dosyasının yolu (örn. "car.obj")
-     * @param displayName UI'da görünecek isim (örn. "Araba")
+     * @param modelPath   .obj file path, or {@link SphereGeometry#KEY}
+     * @param displayName name shown in the UI
      */
     public ModelInstance(String modelPath, String displayName) {
         this.modelPath = modelPath;
         this.displayName = displayName;
-
-        // Varsayılan değerleri ayarla
-        this.position = new Vec3(0, 0, 0);
-        this.rotation = new Vec3(0, 0, 0);
-        this.scale = new Vec3(1, 1, 1);
-        this.color = new Vec3(0.8, 0.8, 0.8); // Varsayılan gri
-        this.materialType = 0.0f; // 0.0f = Diffuse (Mat)
     }
 
-    // --- Getters ---
+    /** Copy with the same geometry, placement and material. */
+    public ModelInstance copy(String newName) {
+        ModelInstance copy = new ModelInstance(modelPath, newName);
+        copy.position = position;
+        copy.rotation = rotation;
+        copy.scale = scale;
+        copy.material = material;
+        return copy;
+    }
+
+    // --- Fluent setup (used by scene presets) ---
+
+    public ModelInstance at(double x, double y, double z) {
+        position = new Vec3(x, y, z);
+        return this;
+    }
+
+    public ModelInstance rotated(double x, double y, double z) {
+        rotation = new Vec3(x, y, z);
+        return this;
+    }
+
+    public ModelInstance scaled(double uniform) {
+        scale = new Vec3(uniform, uniform, uniform);
+        return this;
+    }
+
+    public ModelInstance scaled(double x, double y, double z) {
+        scale = new Vec3(x, y, z);
+        return this;
+    }
+
+    public ModelInstance with(Material newMaterial) {
+        material = newMaterial;
+        return this;
+    }
+
+    // --- Getters / setters ---
 
     public String getDisplayName() { return displayName; }
     public String getModelPath() { return modelPath; }
     public Vec3 getPosition() { return position; }
     public Vec3 getRotation() { return rotation; }
     public Vec3 getScale() { return scale; }
-    public Vec3 getColor() { return color; }
-    public float getMaterialType() { return materialType; }
-
-    // --- Setters (Bunları UI'dan güncellemek için kullanacağız) ---
+    public Material getMaterial() { return material; }
 
     public void setDisplayName(String displayName) { this.displayName = displayName; }
     public void setPosition(Vec3 position) { this.position = position; }
     public void setRotation(Vec3 rotation) { this.rotation = rotation; }
     public void setScale(Vec3 scale) { this.scale = scale; }
-    public void setColor(Vec3 color) { this.color = color; }
-    public void setMaterialType(float materialType) { this.materialType = materialType; }
+    public void setMaterial(Material material) { this.material = material; }
 
     /**
      * Object-to-world transform as a row-major 3x4 matrix (the layout Vulkan's
      * VkTransformMatrixKHR expects): M = Translate * Rz * Ry * Rx * Scale.
      */
     public float[] toTransform3x4() {
-        double ax = Math.toRadians(rotation.x), ay = Math.toRadians(rotation.y), az = Math.toRadians(rotation.z);
-        double cx = Math.cos(ax), sx = Math.sin(ax);
-        double cy = Math.cos(ay), sy = Math.sin(ay);
-        double cz = Math.cos(az), sz = Math.sin(az);
-        // R = Rz * Ry * Rx
-        double[][] r = {
-                {cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx},
-                {sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx},
-                {-sy,     cy * sx,                cy * cx}
-        };
-        double[] s = {scale.x, scale.y, scale.z};
-        double[] t = {position.x, position.y, position.z};
-        float[] m = new float[12];
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 3; col++) {
-                m[row * 4 + col] = (float) (r[row][col] * s[col]);
-            }
-            m[row * 4 + 3] = (float) t[row];
-        }
-        return m;
+        return Transforms.compose(position, rotation, scale);
     }
 
-    /**
-     * JList'te düzgün görünmesi için.
-     */
+    /** Shown in the object list. */
     @Override
     public String toString() {
         return displayName;

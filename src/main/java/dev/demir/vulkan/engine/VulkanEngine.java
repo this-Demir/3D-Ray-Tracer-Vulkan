@@ -2,6 +2,7 @@ package dev.demir.vulkan.engine;
 
 import dev.demir.vulkan.renderer.FrameData;
 import dev.demir.vulkan.scene.CameraState;
+import dev.demir.vulkan.scene.RenderSettings;
 import dev.demir.vulkan.scene.SceneDescription;
 import dev.demir.vulkan.util.Vec3;
 import org.lwjgl.PointerBuffer;

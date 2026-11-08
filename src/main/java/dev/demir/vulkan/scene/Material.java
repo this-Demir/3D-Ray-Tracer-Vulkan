@@ -73,18 +73,4 @@ public record Material(Type type, float[] albedo, float roughness, float emissio
     public Material withIor(float value) {
         return new Material(type, albedo, roughness, emission, value);
     }
-
-    /**
-     * Converts the editor's older "material type number" (0 matte, 1 shiny metal,
-     * 2 fuzzy metal, 3 emissive, 4 glass) plus a color into a Material.
-     */
-    public static Material fromLegacy(float[] color, float legacyType) {
-        return switch ((int) legacyType) {
-            case 1 -> metal(color[0], color[1], color[2], 0f);
-            case 2 -> metal(color[0], color[1], color[2], 0.3f);
-            case 3 -> light(color[0], color[1], color[2], 4f);
-            case 4 -> glass(1.5f).withAlbedo(color[0], color[1], color[2]);
-            default -> diffuse(color[0], color[1], color[2]);
-        };
-    }
 }

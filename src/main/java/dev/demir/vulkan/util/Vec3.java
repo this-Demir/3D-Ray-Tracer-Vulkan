@@ -11,6 +11,8 @@ import java.nio.ByteBuffer;
  */
 public class Vec3 {
 
+    public static final Vec3 ZERO = new Vec3(0, 0, 0);
+
     public final double x, y, z;
 
     public Vec3(double x, double y, double z) {
